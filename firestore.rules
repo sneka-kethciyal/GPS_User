@@ -1,0 +1,87 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // User-owned profile and settings may be read by the authenticated user only.
+    // Admin-created accounts must be managed by the admin backend or Cloud Functions,
+    // not by the Flutter client. Passwords and alternate credentials are never stored here.
+    match /users/{userId} {
+      allow get, list: if request.auth != null && request.auth.uid == userId;
+      allow create, update: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.data.username is string
+        && request.resource.data.keys().hasOnly([
+          'username',
+          'email',
+          'user_id',
+          'group',
+          'account_status',
+          'assigned_schedule',
+          'created_at',
+          'updated_at'
+        ])
+        && !request.resource.data.keys().hasAny(['password', 'plainPassword']);
+      allow delete: if request.auth != null && request.auth.uid == userId;
+    }
+
+    match /{path=**}/expenses/{expenseId} {
+      allow read, delete: if request.auth != null
+        && resource.data.user_id == request.auth.uid;
+    }
+
+    match /users/{userId}/{document=**} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if false;
+    }
+
+    // GPS records are created by the authenticated user's Flutter client and
+    // are immutable after creation.
+    match /users/{userId}/geo_locations/{locationId} {
+      allow create: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.data.user_id == userId
+        && request.resource.data.sync_id == locationId
+        && request.resource.data.latitude is number
+        && request.resource.data.longitude is number;
+      allow update, delete: if false;
+      allow read: if request.auth != null && request.auth.uid == userId;
+    }
+
+    match /users/{userId}/months/{monthId}/expenses/{expenseId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow create, update: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.data.user_id == userId
+        && request.resource.data.month == monthId;
+      allow delete: if false;
+    }
+
+    match /users/{userId}/months/{monthId}/credits/{creditId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow create, update: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.data.user_id == userId
+        && request.resource.data.month == monthId;
+      allow delete: if false;
+    }
+
+    match /groups/{groupId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    match /schedules/{scheduleId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    // Legacy flat collections are not used by the updated app.
+    match /monthly_credits/{documentId} {
+      allow read, write: if false;
+    }
+
+    match /expenses/{documentId} {
+      allow read, write: if false;
+    }
+  }
+}
