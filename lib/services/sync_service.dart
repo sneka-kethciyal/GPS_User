@@ -1,16 +1,19 @@
 import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
+
 import 'database_helper.dart';
 import '../models/expense.dart';
+import '../models/monthly_credit.dart';
 
 class SyncService {
   static final SyncService instance = SyncService._init();
   final DatabaseHelper _dbHelper = DatabaseHelper.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  
+
   bool _isSyncing = false;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
 
@@ -18,9 +21,13 @@ class SyncService {
 
   void initialize() {
     // Monitor network changes to trigger sync when online
-    _connectivitySubscription = Connectivity().onConnectivityChanged.listen((results) {
+    _connectivitySubscription = Connectivity().onConnectivityChanged.listen((
+      results,
+    ) {
       if (results.any((r) => r != ConnectivityResult.none)) {
-        debugPrint('[SyncService] Network connected. Starting background sync...');
+        debugPrint(
+          '[SyncService] Network connected. Starting background sync...',
+        );
         syncAll();
       }
     });
@@ -50,7 +57,8 @@ class SyncService {
         return;
       }
 
-      final userId = explicitUserId ??
+      final userId =
+          explicitUserId ??
           FirebaseAuth.instance.currentUser?.uid ??
           await _dbHelper.getSetting('current_user_id');
 
@@ -62,11 +70,15 @@ class SyncService {
       debugPrint('[SyncService] Starting sync for user: $userId');
       await _syncDeletedExpenses(userId);
       await _pullExpenses(userId);
+      await _migrateLegacyCredits(userId);
+      await _pullCredits(userId);
       await _syncMonthlyCredits(userId);
       await _syncExpenses(userId);
       await _pullExpenses(userId);
       await _syncGeoLocations(userId);
-      debugPrint('[SyncService] Sync completed successfully for user: $userId.');
+      debugPrint(
+        '[SyncService] Sync completed successfully for user: $userId.',
+      );
     } catch (e, stack) {
       debugPrint('[SyncService] Sync error: $e\n$stack');
     } finally {
@@ -80,12 +92,16 @@ class SyncService {
           .collectionGroup('expenses')
           .where('user_id', isEqualTo: userId)
           .get();
-      debugPrint('[SyncService] Firestore expenses fetched: ${snapshot.docs.length} '
-          '(users/$userId/months/{YYYY-MM}/expenses; parent month document not required)');
+      debugPrint(
+        '[SyncService] Firestore expenses fetched: ${snapshot.docs.length} '
+        '(users/$userId/months/{YYYY-MM}/expenses; parent month document not required)',
+      );
       var imported = 0;
       for (final doc in snapshot.docs) {
         if (await _dbHelper.isExpenseDeleted(userId, doc.id)) continue;
-        final month = doc.reference.parent.parent?.id ?? (doc.data()['month'] ?? '').toString();
+        final month =
+            doc.reference.parent.parent?.id ??
+            (doc.data()['month'] ?? '').toString();
         if (month.isEmpty) continue;
         final expense = Expense.fromFirestore(
           userId: userId,
@@ -95,10 +111,14 @@ class SyncService {
         );
         await _dbHelper.upsertFirestoreExpense(expense);
         imported++;
-        debugPrint('[SyncService] Imported expense ${doc.id}: '
-            '${expense.timestamp.toIso8601String()} ₹${expense.expenseAmount}');
+        debugPrint(
+          '[SyncService] Imported expense ${doc.id}: '
+          '${expense.timestamp.toIso8601String()} ₹${expense.expenseAmount}',
+        );
       }
-      debugPrint('[SyncService] Firestore-to-SQLite expenses imported: $imported');
+      debugPrint(
+        '[SyncService] Firestore-to-SQLite expenses imported: $imported',
+      );
     } catch (e, stack) {
       debugPrint('[SyncService] Failed to pull Firestore expenses: $e\n$stack');
     }
@@ -118,7 +138,9 @@ class SyncService {
         await _dbHelper.removeDeletedExpense(userId, firebaseId);
         debugPrint('[SyncService] Deleted Firestore expense $firebaseId');
       } catch (e) {
-        debugPrint('[SyncService] Failed to delete Firestore expense $firebaseId: $e');
+        debugPrint(
+          '[SyncService] Failed to delete Firestore expense $firebaseId: $e',
+        );
       }
     }
   }
@@ -135,7 +157,7 @@ class SyncService {
             .collection('months')
             .doc(credit.month)
             .collection('credits')
-            .doc('monthly_credit');
+            .doc('credit_${credit.id}');
         await docRef.set({
           'user_id': userId,
           'month': credit.month,
@@ -144,15 +166,99 @@ class SyncService {
           'updated_at': credit.createdAt.toIso8601String(),
           'app_name': 'Expense Tracker',
           'company': 'EBT Fusion Infotech',
-        }, SetOptions(merge: true));
+        });
 
         if (credit.id != null) {
           await _dbHelper.markCreditSynced(credit.id!, userId, docRef.id);
         }
         debugPrint('[SyncService] Synced monthly credit for ${credit.month}');
       } catch (e) {
-        debugPrint('[SyncService] Failed to sync monthly credit (${credit.month}): $e');
+        debugPrint(
+          '[SyncService] Failed to sync monthly credit (${credit.month}): $e',
+        );
       }
+    }
+  }
+
+  Future<void> _migrateLegacyCredits(String userId) async {
+    try {
+      final snapshot = await _firestore
+          .collectionGroup('credits')
+          .where('user_id', isEqualTo: userId)
+          .get();
+      for (final legacy in snapshot.docs.where(
+        (doc) => doc.id == 'monthly_credit',
+      )) {
+        final data = legacy.data();
+        final month =
+            legacy.reference.parent.parent?.id ?? data['month']?.toString();
+        final amount = (data['credit_amount'] as num?)?.toDouble();
+        if (month == null ||
+            month.isEmpty ||
+            amount == null ||
+            !amount.isFinite ||
+            amount <= 0) {
+          continue;
+        }
+        await _firestore
+            .collection('users')
+            .doc(userId)
+            .collection('months')
+            .doc(month)
+            .collection('credits')
+            .doc('credit_legacy_$month')
+            .set({
+              ...data,
+              'user_id': userId,
+              'month': month,
+              'credit_amount': amount,
+              'migration_source': legacy.reference.path,
+              'updated_at': DateTime.now().toIso8601String(),
+            });
+      }
+    } catch (e, stack) {
+      debugPrint('[SyncService] Failed to migrate legacy credits: $e\n$stack');
+    }
+  }
+
+  Future<void> _pullCredits(String userId) async {
+    try {
+      final snapshot = await _firestore
+          .collectionGroup('credits')
+          .where('user_id', isEqualTo: userId)
+          .get();
+      for (final doc in snapshot.docs.where(
+        (doc) => doc.id != 'monthly_credit',
+      )) {
+        final data = doc.data();
+        final month =
+            doc.reference.parent.parent?.id ?? data['month']?.toString();
+        final amount = (data['credit_amount'] as num?)?.toDouble();
+        if (month == null ||
+            month.isEmpty ||
+            amount == null ||
+            !amount.isFinite ||
+            amount <= 0) {
+          continue;
+        }
+        final transactionDate = data['transaction_date'];
+        final createdAt = transactionDate is Timestamp
+            ? transactionDate.toDate()
+            : DateTime.tryParse(data['updated_at']?.toString() ?? '') ??
+                  DateTime.now();
+        await _dbHelper.upsertFirestoreCredit(
+          MonthlyCredit(
+            userId: userId,
+            month: month,
+            creditAmount: amount,
+            createdAt: createdAt,
+            isSynced: true,
+            firebaseId: doc.id,
+          ),
+        );
+      }
+    } catch (e, stack) {
+      debugPrint('[SyncService] Failed to pull Firestore credits: $e\n$stack');
     }
   }
 
@@ -168,9 +274,12 @@ class SyncService {
             .collection('months')
             .doc(expense.month)
             .collection('expenses');
-        final docRef = expense.firebaseId != null && expense.firebaseId!.isNotEmpty
-          ? expenseCollection.doc(expense.firebaseId)
-          : expenseCollection.doc('local_${expense.id ?? '${expense.timestamp.millisecondsSinceEpoch}_${expense.itemName.hashCode}'}');
+        final docRef =
+            expense.firebaseId != null && expense.firebaseId!.isNotEmpty
+            ? expenseCollection.doc(expense.firebaseId)
+            : expenseCollection.doc(
+                'local_${expense.id ?? '${expense.timestamp.millisecondsSinceEpoch}_${expense.itemName.hashCode}'}',
+              );
 
         await docRef.set({
           'user_id': userId,
@@ -187,9 +296,13 @@ class SyncService {
         if (expense.id != null) {
           await _dbHelper.markExpenseSynced(expense.id!, userId, docRef.id);
         }
-        debugPrint('[SyncService] Synced expense "${expense.itemName}" (₹${expense.expenseAmount})');
+        debugPrint(
+          '[SyncService] Synced expense "${expense.itemName}" (₹${expense.expenseAmount})',
+        );
       } catch (e) {
-        debugPrint('[SyncService] Failed to sync expense (${expense.itemName}): $e');
+        debugPrint(
+          '[SyncService] Failed to sync expense (${expense.itemName}): $e',
+        );
       }
     }
   }

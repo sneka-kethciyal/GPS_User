@@ -1,6 +1,7 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:uuid/uuid.dart';
+
 import '../models/monthly_credit.dart';
 import '../models/expense.dart';
 import '../models/geo_location.dart';
@@ -26,7 +27,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 6,
+      version: 7,
       onCreate: _createDB,
       onUpgrade: _upgradeDB,
     );
@@ -42,8 +43,7 @@ class DatabaseHelper {
         credit_amount REAL NOT NULL,
         created_at INTEGER NOT NULL,
         is_synced INTEGER NOT NULL DEFAULT 0,
-        firebase_id TEXT,
-        UNIQUE(user_id, month)
+        firebase_id TEXT
       )
     ''');
 
@@ -107,14 +107,19 @@ class DatabaseHelper {
             UNIQUE(user_id, month)
           )
         ''');
-        await txn.execute('''
+        await txn.execute(
+          '''
           INSERT INTO monthly_credits_new
             (id, user_id, month, credit_amount, created_at, is_synced, firebase_id)
           SELECT id, ?, month, credit_amount, created_at, is_synced, firebase_id
           FROM monthly_credits
-        ''', [legacyUserId]);
+        ''',
+          [legacyUserId],
+        );
         await txn.execute('DROP TABLE monthly_credits');
-        await txn.execute('ALTER TABLE monthly_credits_new RENAME TO monthly_credits');
+        await txn.execute(
+          'ALTER TABLE monthly_credits_new RENAME TO monthly_credits',
+        );
         await txn.execute(
           "ALTER TABLE expenses ADD COLUMN user_id TEXT NOT NULL DEFAULT '$legacyUserId'",
         );
@@ -164,42 +169,56 @@ class DatabaseHelper {
         )
       ''');
     }
+    if (oldVersion < 7) {
+      await db.transaction((txn) async {
+        await txn.execute('''
+          CREATE TABLE monthly_credits_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            month TEXT NOT NULL,
+            credit_amount REAL NOT NULL,
+            created_at INTEGER NOT NULL,
+            is_synced INTEGER NOT NULL DEFAULT 0,
+            firebase_id TEXT
+          )
+        ''');
+        await txn.execute('''
+          INSERT INTO monthly_credits_new
+            (id, user_id, month, credit_amount, created_at, is_synced, firebase_id)
+          SELECT id, user_id, month, credit_amount, created_at, is_synced, firebase_id
+          FROM monthly_credits
+        ''');
+        await txn.execute('DROP TABLE monthly_credits');
+        await txn.execute(
+          'ALTER TABLE monthly_credits_new RENAME TO monthly_credits',
+        );
+      });
+    }
   }
 
   // =================== MONTHLY CREDITS ===================
 
-  Future<int> setMonthlyCredit(String userId, String month, double amount) async {
-    final db = await database;
-    final existing = await db.query(
-      'monthly_credits',
-      where: 'user_id = ? AND month = ?',
-      whereArgs: [userId, month],
-    );
-
-    if (existing.isNotEmpty) {
-      return await db.update(
-        'monthly_credits',
-        {
-          'credit_amount': amount,
-          'created_at': DateTime.now().millisecondsSinceEpoch,
-          'is_synced': 0,
-        },
-        where: 'user_id = ? AND month = ?',
-        whereArgs: [userId, month],
-      );
-    } else {
-      return await db.insert(
-        'monthly_credits',
-        {
-          'month': month,
-          'user_id': userId,
-          'credit_amount': amount,
-          'created_at': DateTime.now().millisecondsSinceEpoch,
-          'is_synced': 0,
-          'firebase_id': null,
-        },
+  Future<int> setMonthlyCredit(
+    String userId,
+    String month,
+    double amount,
+  ) async {
+    if (!amount.isFinite || amount <= 0) {
+      throw ArgumentError.value(
+        amount,
+        'amount',
+        'Credit amount must be greater than zero.',
       );
     }
+    final db = await database;
+    return await db.insert('monthly_credits', {
+      'month': month,
+      'user_id': userId,
+      'credit_amount': amount,
+      'created_at': DateTime.now().millisecondsSinceEpoch,
+      'is_synced': 0,
+      'firebase_id': null,
+    });
   }
 
   Future<MonthlyCredit?> getMonthlyCredit(String userId, String month) async {
@@ -208,18 +227,23 @@ class DatabaseHelper {
       'monthly_credits',
       where: 'user_id = ? AND month = ?',
       whereArgs: [userId, month],
-      limit: 1,
+      orderBy: 'created_at ASC',
     );
 
-    if (result.isNotEmpty) {
-      return MonthlyCredit.fromMap(result.first);
-    }
-    return null;
+    if (result.isEmpty) return null;
+    final credits = result.map(MonthlyCredit.fromMap).toList();
+    final latest = credits.last;
+    return latest.copyWith(creditAmount: MonthlyCredit.totalForMonth(credits));
   }
 
   Future<List<MonthlyCredit>> getAllMonthlyCredits(String userId) async {
     final db = await database;
-    final result = await db.query('monthly_credits', where: 'user_id = ?', whereArgs: [userId], orderBy: 'month DESC');
+    final result = await db.query(
+      'monthly_credits',
+      where: 'user_id = ?',
+      whereArgs: [userId],
+      orderBy: 'month DESC',
+    );
     return result.map((e) => MonthlyCredit.fromMap(e)).toList();
   }
 
@@ -237,12 +261,39 @@ class DatabaseHelper {
     final db = await database;
     return await db.update(
       'monthly_credits',
-      {
-        'is_synced': 1,
-        'firebase_id': firebaseId,
-      },
+      {'is_synced': 1, 'firebase_id': firebaseId},
       where: 'id = ? AND user_id = ?',
       whereArgs: [id, userId],
+    );
+  }
+
+  Future<void> upsertFirestoreCredit(MonthlyCredit credit) async {
+    final db = await database;
+    final existing = await db.query(
+      'monthly_credits',
+      where: 'user_id = ? AND firebase_id = ?',
+      whereArgs: [credit.userId, credit.firebaseId],
+      limit: 1,
+    );
+    if (existing.isEmpty) {
+      existing.addAll(
+        await db.query(
+          'monthly_credits',
+          where: 'user_id = ? AND month = ? AND firebase_id = ?',
+          whereArgs: [credit.userId, credit.month, 'monthly_credit'],
+          limit: 1,
+        ),
+      );
+    }
+    if (existing.isEmpty) {
+      await db.insert('monthly_credits', credit.toMap());
+      return;
+    }
+    await db.update(
+      'monthly_credits',
+      credit.toMap()..remove('id'),
+      where: 'id = ? AND user_id = ?',
+      whereArgs: [existing.first['id'], credit.userId],
     );
   }
 
@@ -288,22 +339,31 @@ class DatabaseHelper {
     if (existing.isEmpty) {
       await db.insert('expenses', values);
     } else {
-      await db.update('expenses', values, where: 'id = ?', whereArgs: [existing.first['id']]);
+      await db.update(
+        'expenses',
+        values,
+        where: 'id = ?',
+        whereArgs: [existing.first['id']],
+      );
     }
   }
 
   Future<void> addDeletedExpense(String userId, String firebaseId) async {
     final db = await database;
-    await db.insert(
-      'deleted_expenses',
-      {'user_id': userId, 'firebase_id': firebaseId, 'deleted_at': DateTime.now().millisecondsSinceEpoch},
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    await db.insert('deleted_expenses', {
+      'user_id': userId,
+      'firebase_id': firebaseId,
+      'deleted_at': DateTime.now().millisecondsSinceEpoch,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<List<Map<String, dynamic>>> getDeletedExpenses(String userId) async {
     final db = await database;
-    return db.query('deleted_expenses', where: 'user_id = ?', whereArgs: [userId]);
+    return db.query(
+      'deleted_expenses',
+      where: 'user_id = ?',
+      whereArgs: [userId],
+    );
   }
 
   Future<int> removeDeletedExpense(String userId, String firebaseId) async {
@@ -339,7 +399,12 @@ class DatabaseHelper {
 
   Future<List<Expense>> getAllExpenses(String userId) async {
     final db = await database;
-    final result = await db.query('expenses', where: 'user_id = ?', whereArgs: [userId], orderBy: 'timestamp DESC');
+    final result = await db.query(
+      'expenses',
+      where: 'user_id = ?',
+      whereArgs: [userId],
+      orderBy: 'timestamp DESC',
+    );
     return result.map((e) => Expense.fromMap(e)).toList();
   }
 
@@ -364,14 +429,15 @@ class DatabaseHelper {
     return result.map((e) => Expense.fromMap(e)).toList();
   }
 
-  Future<int> markExpenseSynced(int id, String userId, String firebaseId) async {
+  Future<int> markExpenseSynced(
+    int id,
+    String userId,
+    String firebaseId,
+  ) async {
     final db = await database;
     return await db.update(
       'expenses',
-      {
-        'is_synced': 1,
-        'firebase_id': firebaseId,
-      },
+      {'is_synced': 1, 'firebase_id': firebaseId},
       where: 'id = ? AND user_id = ?',
       whereArgs: [id, userId],
     );
@@ -394,7 +460,8 @@ class DatabaseHelper {
   Future<int> insertGeoLocation(GeoLocationRecord record) async {
     final db = await database;
     final map = record.toMap();
-    if ((map['sync_id'] as String?) == null || (map['sync_id'] as String).isEmpty) {
+    if ((map['sync_id'] as String?) == null ||
+        (map['sync_id'] as String).isEmpty) {
       map['sync_id'] = const Uuid().v4();
     }
     return await db.insert('geo_locations', map);
@@ -411,7 +478,9 @@ class DatabaseHelper {
       limit: 1,
     );
     if (result.isEmpty) return null;
-    return DateTime.fromMillisecondsSinceEpoch(result.first['timestamp'] as int);
+    return DateTime.fromMillisecondsSinceEpoch(
+      result.first['timestamp'] as int,
+    );
   }
 
   Future<GeoLocationRecord?> getLatestGeoLocation(String userId) async {
@@ -431,11 +500,10 @@ class DatabaseHelper {
 
   Future<void> setSetting(String key, String value) async {
     final db = await database;
-    await db.insert(
-      'app_settings',
-      {'key': key, 'value': value},
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    await db.insert('app_settings', {
+      'key': key,
+      'value': value,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<String?> getSetting(String key) async {
@@ -458,7 +526,10 @@ class DatabaseHelper {
     return TrackingSchedule.fromJson(json);
   }
 
-  Future<void> saveTrackingSchedule(String userId, TrackingSchedule schedule) async {
+  Future<void> saveTrackingSchedule(
+    String userId,
+    TrackingSchedule schedule,
+  ) async {
     await setSetting('tracking_schedule_$userId', schedule.toJson());
   }
 
@@ -503,7 +574,9 @@ class DatabaseHelper {
 
   Future<int> clearOldSyncedLocations(int daysOld) async {
     final db = await database;
-    final cutoff = DateTime.now().subtract(Duration(days: daysOld)).millisecondsSinceEpoch;
+    final cutoff = DateTime.now()
+        .subtract(Duration(days: daysOld))
+        .millisecondsSinceEpoch;
     return await db.delete(
       'geo_locations',
       where: 'is_synced = 1 AND timestamp < ?',

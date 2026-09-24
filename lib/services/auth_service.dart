@@ -1,5 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
 
 import '../models/tracking_schedule.dart';
 
@@ -18,9 +19,16 @@ class AppUserProfile {
 }
 
 class AuthService {
-  AuthService({FirebaseAuth? auth}) : _auth = auth ?? FirebaseAuth.instance;
+  AuthService({
+    FirebaseAuth? auth,
+    FirebaseFirestore? firestore,
+    this.lastLoginWriter,
+  }) : _auth = auth ?? FirebaseAuth.instance,
+       _firestore = firestore ?? FirebaseFirestore.instance;
 
   final FirebaseAuth _auth;
+  final FirebaseFirestore _firestore;
+  final Future<void> Function(String uid)? lastLoginWriter;
 
   Stream<User?> get authStateChanges => _auth.authStateChanges();
 
@@ -29,10 +37,31 @@ class AuthService {
     required String password,
   }) async {
     final email = await resolveLoginEmail(username);
-    return _auth.signInWithEmailAndPassword(
+    final credential = await _auth.signInWithEmailAndPassword(
       email: email,
       password: password,
     );
+    final user = credential.user;
+    if (user != null) {
+      try {
+        await (lastLoginWriter ?? _writeLastLogin)(user.uid);
+      } catch (error) {
+        // A profile timestamp failure must not log the authenticated user out.
+        debugPrint('[AuthService] Could not update last_login: $error');
+      }
+    }
+    return credential;
+  }
+
+  static Map<String, dynamic> lastLoginUpdate() {
+    return {'last_login': FieldValue.serverTimestamp()};
+  }
+
+  Future<void> _writeLastLogin(String uid) {
+    return _firestore
+        .collection('users')
+        .doc(uid)
+        .set(lastLoginUpdate(), SetOptions(merge: true));
   }
 
   Future<void> sendPasswordResetEmail(String username) async {
@@ -53,7 +82,10 @@ class AuthService {
     final userId = uid ?? _auth.currentUser?.uid;
     if (userId == null || userId.isEmpty) return null;
 
-    final doc = await FirebaseFirestore.instance.collection('users').doc(userId).get();
+    final doc = await FirebaseFirestore.instance
+        .collection('users')
+        .doc(userId)
+        .get();
     if (!doc.exists || doc.data() == null) return null;
     return profileFromMap(doc.data()!);
   }
@@ -61,7 +93,9 @@ class AuthService {
   Future<bool> isCurrentUserActive() async {
     final profile = await loadCurrentUserProfile();
     if (profile == null) return false;
-    return isAccountActive({'account_status': profile.accountStatus ?? 'active'});
+    return isAccountActive({
+      'account_status': profile.accountStatus ?? 'active',
+    });
   }
 
   Future<void> changePassword({
@@ -141,12 +175,19 @@ class AuthService {
   }
 
   static AppUserProfile profileFromMap(Map<String, dynamic> data) {
-    final username = (data['username'] ?? data['login_id'] ?? data['email'] ?? '')
-        .toString()
-        .trim();
-    final groupValue = data['group_id'] ?? data['group'] ?? data['user_group'] ?? data['group_name'];
-    final statusValue = data['account_status'] ?? data['status'] ?? data['accountStatus'];
-    final rawSchedule = data['assigned_schedule'] ??
+    final username =
+        (data['username'] ?? data['login_id'] ?? data['email'] ?? '')
+            .toString()
+            .trim();
+    final groupValue =
+        data['group_id'] ??
+        data['group'] ??
+        data['user_group'] ??
+        data['group_name'];
+    final statusValue =
+        data['account_status'] ?? data['status'] ?? data['accountStatus'];
+    final rawSchedule =
+        data['assigned_schedule'] ??
         data['tracking_schedule'] ??
         data['schedule'] ??
         data['user_schedule'];
@@ -158,17 +199,22 @@ class AuthService {
       schedule: rawSchedule is Map<String, dynamic>
           ? TrackingSchedule.fromFirestore(rawSchedule)
           : rawSchedule is Map
-              ? TrackingSchedule.fromFirestore(Map<String, dynamic>.from(rawSchedule))
-              : null,
+          ? TrackingSchedule.fromFirestore(
+              Map<String, dynamic>.from(rawSchedule),
+            )
+          : null,
     );
   }
 
   static bool isAccountActive(Map<String, dynamic> data) {
-    final value = data['account_status'] ?? data['status'] ?? data['accountStatus'];
+    final value =
+        data['account_status'] ?? data['status'] ?? data['accountStatus'];
     if (value is bool) return value;
     if (value is String) {
       final normalized = value.trim().toLowerCase();
-      return normalized == 'active' || normalized == 'enabled' || normalized == 'approved';
+      return normalized == 'active' ||
+          normalized == 'enabled' ||
+          normalized == 'approved';
     }
     return true;
   }

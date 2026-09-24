@@ -19,6 +19,13 @@ class MonthlyCredit {
     this.firebaseId,
   });
 
+  static double totalForMonth(Iterable<MonthlyCredit> credits) {
+    return credits.fold<double>(
+      0,
+      (total, credit) => total + credit.creditAmount,
+    );
+  }
+
   Map<String, dynamic> toMap() {
     return {
       if (id != null) 'id': id,

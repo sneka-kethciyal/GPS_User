@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
+
 import '../models/expense.dart';
 import '../providers/expense_provider.dart';
 import '../providers/location_provider.dart';
@@ -19,7 +20,11 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
   final _amountController = TextEditingController();
   final _creditController = TextEditingController();
 
-  final currencyFormat = NumberFormat.currency(locale: 'en_IN', symbol: '₹', decimalDigits: 2);
+  final currencyFormat = NumberFormat.currency(
+    locale: 'en_IN',
+    symbol: '₹',
+    decimalDigits: 2,
+  );
 
   @override
   void dispose() {
@@ -30,7 +35,7 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
   }
 
   void _showSetCreditDialog(BuildContext context, double currentCredit) {
-    _creditController.text = currentCredit > 0 ? currentCredit.toStringAsFixed(2) : '';
+    _creditController.clear();
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -45,59 +50,153 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                 color: AppTheme.pastelMintLight,
                 borderRadius: BorderRadius.circular(14),
               ),
-              child: const Icon(Icons.account_balance_wallet_rounded, color: AppTheme.pastelMint, size: 24),
+              child: const Icon(
+                Icons.account_balance_wallet_rounded,
+                color: AppTheme.pastelMint,
+                size: 24,
+              ),
             ),
             const SizedBox(width: 12),
             const Text(
-              'Set Monthly Credit',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: AppTheme.textPrimary),
-            ),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Enter the total allocated credit or budget for this month.',
-              style: TextStyle(fontSize: 13, color: AppTheme.textSecondary, height: 1.4),
-            ),
-            const SizedBox(height: 18),
-            TextField(
-              controller: _creditController,
-              keyboardType: const TextInputType.numberWithOptions(decimal: true),
-              style: const TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.w600, fontSize: 16),
-              decoration: InputDecoration(
-                labelText: 'Credit Amount (₹)',
-                hintText: '0.00',
-                prefixIcon: const Icon(Icons.attach_money_rounded, color: AppTheme.pastelMint),
-                fillColor: AppTheme.surfaceMuted,
+              'Manage Monthly Credit',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 18,
+                color: AppTheme.textPrimary,
               ),
-              autofocus: true,
             ),
           ],
         ),
-        actionsPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 230,
+          child: DefaultTabController(
+            length: 2,
+            child: Column(
+              children: [
+                const TabBar(
+                  labelColor: AppTheme.pastelLavender,
+                  unselectedLabelColor: AppTheme.textSecondary,
+                  tabs: [
+                    Tab(text: 'Add Credit'),
+                    Tab(text: 'Credit Total'),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Expanded(
+                  child: TabBarView(
+                    children: [
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Add a new credit to the existing monthly total.',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: AppTheme.textSecondary,
+                              height: 1.4,
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          TextField(
+                            controller: _creditController,
+                            keyboardType: const TextInputType.numberWithOptions(
+                              decimal: true,
+                            ),
+                            style: const TextStyle(
+                              color: AppTheme.textPrimary,
+                              fontWeight: FontWeight.w600,
+                              fontSize: 16,
+                            ),
+                            decoration: InputDecoration(
+                              labelText: 'Credit Amount (₹)',
+                              hintText: '0.00',
+                              prefixIcon: const Icon(
+                                Icons.currency_rupee_rounded,
+                                color: AppTheme.pastelMint,
+                              ),
+                              fillColor: AppTheme.surfaceMuted,
+                            ),
+                            autofocus: true,
+                          ),
+                        ],
+                      ),
+                      Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Text(
+                              'Total Credit',
+                              style: TextStyle(
+                                fontSize: 13,
+                                color: AppTheme.textSecondary,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              currencyFormat.format(currentCredit),
+                              style: const TextStyle(
+                                fontSize: 26,
+                                fontWeight: FontWeight.w800,
+                                color: Color(0xFF059669),
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            const Text(
+                              'Add another credit from the first tab.',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: AppTheme.textSecondary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        actionsPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 12,
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),
             style: TextButton.styleFrom(
               foregroundColor: AppTheme.textSecondary,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
             ),
             child: const Text('Cancel'),
           ),
           ElevatedButton(
-            onPressed: () {
+            onPressed: () async {
               final val = double.tryParse(_creditController.text);
-              if (val != null && val >= 0) {
-                Provider.of<ExpenseProvider>(context, listen: false).updateMonthlyCredit(val);
+              if (val != null && val.isFinite && val > 0) {
+                await Provider.of<ExpenseProvider>(
+                  context,
+                  listen: false,
+                ).updateMonthlyCredit(val);
+                if (!mounted || !ctx.mounted) return;
                 Navigator.pop(ctx);
                 ScaffoldMessenger.of(context).showSnackBar(
                   SnackBar(
-                    content: Text('Updated credit to ${currencyFormat.format(val)}'),
+                    content: Text(
+                      'Added credit of ${currencyFormat.format(val)}',
+                    ),
                     backgroundColor: AppTheme.pastelMint,
                     behavior: SnackBarBehavior.floating,
+                  ),
+                );
+              } else {
+                ScaffoldMessenger.of(ctx).showSnackBar(
+                  const SnackBar(
+                    content: Text('Enter a credit amount greater than ₹0.00.'),
                   ),
                 );
               }
@@ -105,9 +204,11 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
             style: ElevatedButton.styleFrom(
               backgroundColor: AppTheme.pastelLavender,
               foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+              ),
             ),
-            child: const Text('Save Credit'),
+            child: const Text('Add Credit'),
           ),
         ],
       ),
@@ -127,7 +228,9 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
       if (!added || !mounted) {
         if (mounted && !added) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Could not add expense. Please try again.')),
+            const SnackBar(
+              content: Text('Could not add expense. Please try again.'),
+            ),
           );
         }
         return;
@@ -139,10 +242,14 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
 
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Added expense: $itemName (${currencyFormat.format(amount)})'),
+          content: Text(
+            'Added expense: $itemName (${currencyFormat.format(amount)})',
+          ),
           backgroundColor: AppTheme.pastelLavender,
           behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
         ),
       );
     }
@@ -153,7 +260,9 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
     final expenseProvider = Provider.of<ExpenseProvider>(context);
     final locationProvider = Provider.of<LocationProvider>(context);
 
-    final selectedDate = DateTime.tryParse('${expenseProvider.selectedMonth}-01') ?? DateTime.now();
+    final selectedDate =
+        DateTime.tryParse('${expenseProvider.selectedMonth}-01') ??
+        DateTime.now();
     final monthLabel = DateFormat('MMMM yyyy').format(selectedDate);
     final todayExpenses = expenseProvider.todayExpenses;
 
@@ -196,9 +305,15 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                 ? const SizedBox(
                     width: 20,
                     height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2.2, color: AppTheme.pastelLavender),
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2.2,
+                      color: AppTheme.pastelLavender,
+                    ),
                   )
-                : const Icon(Icons.sync_rounded, color: AppTheme.pastelLavender),
+                : const Icon(
+                    Icons.sync_rounded,
+                    color: AppTheme.pastelLavender,
+                  ),
             tooltip: 'Sync with Firestore',
             onPressed: () => expenseProvider.triggerManualSync(),
           ),
@@ -250,7 +365,10 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                   ),
                   const SizedBox(width: 8),
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
+                    ),
                     decoration: BoxDecoration(
                       color: AppTheme.pastelLavenderLight,
                       borderRadius: BorderRadius.circular(10),
@@ -294,21 +412,35 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('Today\'s expenses', style: TextStyle(fontSize: 12, color: AppTheme.textSecondary)),
+                const Text(
+                  'Today\'s expenses',
+                  style: TextStyle(fontSize: 12, color: AppTheme.textSecondary),
+                ),
                 Text(
                   currencyFormat.format(provider.todayTotalExpense),
-                  style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: AppTheme.textPrimary),
+                  style: const TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.w800,
+                    color: AppTheme.textPrimary,
+                  ),
                 ),
               ],
             ),
           ),
-          Text('${provider.todayExpenses.length} item(s)', style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary)),
+          Text(
+            '${provider.todayExpenses.length} item(s)',
+            style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildMonthHeader(BuildContext context, ExpenseProvider provider, String monthLabel) {
+  Widget _buildMonthHeader(
+    BuildContext context,
+    ExpenseProvider provider,
+    String monthLabel,
+  ) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       decoration: BoxDecoration(
@@ -334,29 +466,49 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                   color: AppTheme.pastelLavenderLight,
                   borderRadius: BorderRadius.circular(12),
                 ),
-                child: const Icon(Icons.calendar_month_rounded, color: AppTheme.pastelLavender, size: 20),
+                child: const Icon(
+                  Icons.calendar_month_rounded,
+                  color: AppTheme.pastelLavender,
+                  size: 20,
+                ),
               ),
               const SizedBox(width: 12),
               Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('Active Period', style: TextStyle(fontSize: 11, color: AppTheme.textMuted, fontWeight: FontWeight.w500)),
+                  const Text(
+                    'Active Period',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: AppTheme.textMuted,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
                   Text(
                     monthLabel,
-                    style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: AppTheme.textPrimary),
+                    style: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                      color: AppTheme.textPrimary,
+                    ),
                   ),
                 ],
               ),
             ],
           ),
           IconButton(
-            icon: const Icon(Icons.edit_calendar_rounded, color: AppTheme.pastelLavender, size: 22),
+            icon: const Icon(
+              Icons.edit_calendar_rounded,
+              color: AppTheme.pastelLavender,
+              size: 22,
+            ),
             tooltip: 'Change Month',
             onPressed: () async {
               final now = DateTime.now();
               final picked = await showDatePicker(
                 context: context,
-                initialDate: DateTime.tryParse('${provider.selectedMonth}-01') ?? now,
+                initialDate:
+                    DateTime.tryParse('${provider.selectedMonth}-01') ?? now,
                 firstDate: DateTime(2020),
                 lastDate: DateTime(2035),
                 initialDatePickerMode: DatePickerMode.year,
@@ -384,7 +536,10 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
     );
   }
 
-  Widget _buildGeoStatusChip(BuildContext context, LocationProvider locProvider) {
+  Widget _buildGeoStatusChip(
+    BuildContext context,
+    LocationProvider locProvider,
+  ) {
     final isEnabled = locProvider.isTrackingEnabled;
     final schedule = locProvider.schedule;
     final status = locProvider.scheduleStatus;
@@ -420,7 +575,8 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
       iconColor = const Color(0xFFD97706);
       chipIcon = Icons.schedule_rounded;
       titleText = status.statusMessage;
-      subtitleText = status.unavailableReason ??
+      subtitleText =
+          status.unavailableReason ??
           '${schedule.formattedDaysSummary}, ${schedule.formattedTimeRange}';
     }
 
@@ -466,7 +622,10 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
               Switch.adaptive(
                 value: isEnabled,
                 onChanged: (enable) async {
-                  final error = await locProvider.toggleTracking(context, enable);
+                  final error = await locProvider.toggleTracking(
+                    context,
+                    enable,
+                  );
                   if (error != null && context.mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       SnackBar(
@@ -487,7 +646,10 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
           Row(
             children: [
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
                 decoration: BoxDecoration(
                   color: AppTheme.pastelBlueLight,
                   borderRadius: BorderRadius.circular(10),
@@ -495,7 +657,11 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.lock_clock_rounded, size: 14, color: AppTheme.pastelBlue),
+                    const Icon(
+                      Icons.lock_clock_rounded,
+                      size: 14,
+                      color: AppTheme.pastelBlue,
+                    ),
                     const SizedBox(width: 6),
                     Text(
                       '${schedule.formattedDaysSummary} · ${schedule.formattedTimeRange}',
@@ -528,8 +694,10 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                   style: TextButton.styleFrom(
                     visualDensity: VisualDensity.compact,
                     foregroundColor: AppTheme.pastelBlue,
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
                   ),
                   icon: locProvider.isCapturingNow
                       ? const SizedBox(
@@ -541,7 +709,9 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                   label: Text(
                     locProvider.isCapturingNow ? 'Capturing...' : 'Capture Now',
                     style: const TextStyle(
-                        fontSize: 11, fontWeight: FontWeight.bold),
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                 ),
               ],
@@ -583,7 +753,10 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
     );
   }
 
-  Widget _buildBalanceSummaryCard(BuildContext context, ExpenseProvider provider) {
+  Widget _buildBalanceSummaryCard(
+    BuildContext context,
+    ExpenseProvider provider,
+  ) {
     final isNegative = provider.isNegativeBalance;
     final totalCredit = provider.totalCredit;
     final totalDebit = provider.totalDebit;
@@ -600,12 +773,15 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
         ),
         borderRadius: BorderRadius.circular(22),
         border: Border.all(
-          color: isNegative ? AppTheme.pastelCoral.withAlpha(120) : AppTheme.pastelLavender.withAlpha(100),
+          color: isNegative
+              ? AppTheme.pastelCoral.withAlpha(120)
+              : AppTheme.pastelLavender.withAlpha(100),
           width: 1.5,
         ),
         boxShadow: [
           BoxShadow(
-            color: (isNegative ? AppTheme.pastelCoral : AppTheme.pastelLavender).withAlpha(15),
+            color: (isNegative ? AppTheme.pastelCoral : AppTheme.pastelLavender)
+                .withAlpha(15),
             blurRadius: 18,
             offset: const Offset(0, 4),
           ),
@@ -625,12 +801,17 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                   fontSize: 12,
                   fontWeight: FontWeight.w800,
                   letterSpacing: 1.1,
-                  color: isNegative ? const Color(0xFFE11D48) : AppTheme.pastelLavender,
+                  color: isNegative
+                      ? const Color(0xFFE11D48)
+                      : AppTheme.pastelLavender,
                 ),
               ),
               if (isNegative)
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 4,
+                  ),
                   decoration: BoxDecoration(
                     color: AppTheme.pastelCoral.withAlpha(40),
                     borderRadius: BorderRadius.circular(10),
@@ -639,11 +820,19 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                   child: const Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.warning_amber_rounded, color: Color(0xFFDC2626), size: 14),
+                      Icon(
+                        Icons.warning_amber_rounded,
+                        color: Color(0xFFDC2626),
+                        size: 14,
+                      ),
                       SizedBox(width: 4),
                       Text(
                         'OVER BUDGET',
-                        style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFFDC2626)),
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFFDC2626),
+                        ),
                       ),
                     ],
                   ),
@@ -658,7 +847,9 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
             style: TextStyle(
               fontSize: 32,
               fontWeight: FontWeight.w800,
-              color: isNegative ? const Color(0xFFDC2626) : const Color(0xFF059669),
+              color: isNegative
+                  ? const Color(0xFFDC2626)
+                  : const Color(0xFF059669),
             ),
           ),
           const SizedBox(height: 16),
@@ -678,7 +869,9 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                     decoration: BoxDecoration(
                       color: AppTheme.cardBackground,
                       borderRadius: BorderRadius.circular(16),
-                      border: Border.all(color: AppTheme.pastelMint.withAlpha(80)),
+                      border: Border.all(
+                        color: AppTheme.pastelMint.withAlpha(80),
+                      ),
                       boxShadow: [
                         BoxShadow(
                           color: AppTheme.pastelMint.withAlpha(10),
@@ -698,21 +891,37 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                                 color: AppTheme.pastelMintLight,
                                 borderRadius: BorderRadius.circular(6),
                               ),
-                              child: const Icon(Icons.arrow_downward_rounded, color: AppTheme.pastelMint, size: 14),
+                              child: const Icon(
+                                Icons.arrow_downward_rounded,
+                                color: AppTheme.pastelMint,
+                                size: 14,
+                              ),
                             ),
                             const SizedBox(width: 6),
                             const Text(
                               'Total Credit',
-                              style: TextStyle(fontSize: 12, color: AppTheme.textSecondary, fontWeight: FontWeight.w600),
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: AppTheme.textSecondary,
+                                fontWeight: FontWeight.w600,
+                              ),
                             ),
                             const Spacer(),
-                            const Icon(Icons.edit_rounded, size: 14, color: AppTheme.pastelLavender),
+                            const Icon(
+                              Icons.edit_rounded,
+                              size: 14,
+                              color: AppTheme.pastelLavender,
+                            ),
                           ],
                         ),
                         const SizedBox(height: 6),
                         Text(
                           currencyFormat.format(totalCredit),
-                          style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800, color: Color(0xFF059669)),
+                          style: const TextStyle(
+                            fontSize: 17,
+                            fontWeight: FontWeight.w800,
+                            color: Color(0xFF059669),
+                          ),
                         ),
                       ],
                     ),
@@ -728,7 +937,9 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                   decoration: BoxDecoration(
                     color: AppTheme.cardBackground,
                     borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: AppTheme.pastelCoral.withAlpha(80)),
+                    border: Border.all(
+                      color: AppTheme.pastelCoral.withAlpha(80),
+                    ),
                     boxShadow: [
                       BoxShadow(
                         color: AppTheme.pastelCoral.withAlpha(10),
@@ -748,19 +959,31 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                               color: AppTheme.pastelCoralLight,
                               borderRadius: BorderRadius.circular(6),
                             ),
-                            child: const Icon(Icons.arrow_upward_rounded, color: AppTheme.pastelCoral, size: 14),
+                            child: const Icon(
+                              Icons.arrow_upward_rounded,
+                              color: AppTheme.pastelCoral,
+                              size: 14,
+                            ),
                           ),
                           const SizedBox(width: 6),
                           const Text(
                             'Total Debit',
-                            style: TextStyle(fontSize: 12, color: AppTheme.textSecondary, fontWeight: FontWeight.w600),
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: AppTheme.textSecondary,
+                              fontWeight: FontWeight.w600,
+                            ),
                           ),
                         ],
                       ),
                       const SizedBox(height: 6),
                       Text(
                         currencyFormat.format(totalDebit),
-                        style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800, color: Color(0xFFDC2626)),
+                        style: const TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w800,
+                          color: Color(0xFFDC2626),
+                        ),
                       ),
                     ],
                   ),
@@ -773,7 +996,10 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
     );
   }
 
-  Widget _buildExpenseInputCard(BuildContext context, ExpenseProvider provider) {
+  Widget _buildExpenseInputCard(
+    BuildContext context,
+    ExpenseProvider provider,
+  ) {
     return Container(
       decoration: BoxDecoration(
         color: AppTheme.cardBackground,
@@ -801,23 +1027,37 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                     color: AppTheme.pastelLavenderLight,
                     borderRadius: BorderRadius.circular(10),
                   ),
-                  child: const Icon(Icons.add_shopping_cart_rounded, color: AppTheme.pastelLavender, size: 18),
+                  child: const Icon(
+                    Icons.add_shopping_cart_rounded,
+                    color: AppTheme.pastelLavender,
+                    size: 18,
+                  ),
                 ),
                 const SizedBox(width: 10),
                 const Text(
                   'Add New Expense',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: AppTheme.textPrimary),
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                    color: AppTheme.textPrimary,
+                  ),
                 ),
               ],
             ),
             const SizedBox(height: 16),
             TextFormField(
               controller: _itemNameController,
-              style: const TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.w500),
+              style: const TextStyle(
+                color: AppTheme.textPrimary,
+                fontWeight: FontWeight.w500,
+              ),
               decoration: const InputDecoration(
                 labelText: 'Item / Service Name',
                 hintText: 'e.g. Fuel, Office Stationery, Lunch',
-                prefixIcon: Icon(Icons.shopping_bag_outlined, color: AppTheme.pastelBlue),
+                prefixIcon: Icon(
+                  Icons.shopping_bag_outlined,
+                  color: AppTheme.pastelBlue,
+                ),
               ),
               validator: (val) {
                 if (val == null || val.trim().isEmpty) {
@@ -829,12 +1069,20 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
             const SizedBox(height: 12),
             TextFormField(
               controller: _amountController,
-              keyboardType: const TextInputType.numberWithOptions(decimal: true),
-              style: const TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.w600),
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              style: const TextStyle(
+                color: AppTheme.textPrimary,
+                fontWeight: FontWeight.w600,
+              ),
               decoration: const InputDecoration(
                 labelText: 'Expense Amount (₹)',
                 hintText: '0.00',
-                prefixIcon: Icon(Icons.attach_money_rounded, color: AppTheme.pastelCoral),
+                prefixIcon: Icon(
+                  Icons.attach_money_rounded,
+                  color: AppTheme.pastelCoral,
+                ),
               ),
               validator: (val) {
                 if (val == null || val.trim().isEmpty) {
@@ -859,7 +1107,9 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                   foregroundColor: Colors.white,
                   elevation: 0,
                   padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
                 ),
               ),
             ),
@@ -896,12 +1146,20 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                 color: AppTheme.pastelLavenderLight,
                 shape: BoxShape.circle,
               ),
-              child: const Icon(Icons.receipt_long_rounded, size: 36, color: AppTheme.pastelLavender),
+              child: const Icon(
+                Icons.receipt_long_rounded,
+                size: 36,
+                color: AppTheme.pastelLavender,
+              ),
             ),
             const SizedBox(height: 14),
             const Text(
               'No expenses recorded yet',
-              style: TextStyle(fontWeight: FontWeight.w700, color: AppTheme.textPrimary, fontSize: 15),
+              style: TextStyle(
+                fontWeight: FontWeight.w700,
+                color: AppTheme.textPrimary,
+                fontSize: 15,
+              ),
             ),
             const SizedBox(height: 4),
             const Text(
@@ -952,7 +1210,10 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
               color: AppTheme.pastelCoral,
               borderRadius: BorderRadius.circular(18),
             ),
-            child: const Icon(Icons.delete_outline_rounded, color: Colors.white),
+            child: const Icon(
+              Icons.delete_outline_rounded,
+              color: Colors.white,
+            ),
           ),
           onDismissed: (_) {
             if (item.id != null) {
@@ -981,7 +1242,11 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                     color: bgColor,
                     borderRadius: BorderRadius.circular(14),
                   ),
-                  child: Icon(Icons.receipt_rounded, color: iconColor, size: 20),
+                  child: Icon(
+                    Icons.receipt_rounded,
+                    color: iconColor,
+                    size: 20,
+                  ),
                 ),
                 const SizedBox(width: 14),
                 Expanded(
@@ -1001,13 +1266,20 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                         children: [
                           Text(
                             timeStr,
-                            style: const TextStyle(fontSize: 12, color: AppTheme.textMuted),
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: AppTheme.textMuted,
+                            ),
                           ),
                           const SizedBox(width: 8),
                           Icon(
-                            item.isSynced ? Icons.cloud_done_rounded : Icons.cloud_queue_rounded,
+                            item.isSynced
+                                ? Icons.cloud_done_rounded
+                                : Icons.cloud_queue_rounded,
                             size: 14,
-                            color: item.isSynced ? AppTheme.pastelMint : AppTheme.textMuted,
+                            color: item.isSynced
+                                ? AppTheme.pastelMint
+                                : AppTheme.textMuted,
                           ),
                           const SizedBox(width: 4),
                           Text(
@@ -1015,7 +1287,9 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
                             style: TextStyle(
                               fontSize: 11,
                               fontWeight: FontWeight.w600,
-                              color: item.isSynced ? const Color(0xFF059669) : AppTheme.textMuted,
+                              color: item.isSynced
+                                  ? const Color(0xFF059669)
+                                  : AppTheme.textMuted,
                             ),
                           ),
                         ],
