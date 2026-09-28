@@ -78,4 +78,24 @@ void main() {
     expect(update.keys, contains('last_login'));
     expect(update['last_login'], isA<FieldValue>());
   });
+
+  test(
+    'password reset request update contains only the admin request fields',
+    () {
+      final update = AuthService.passwordResetRequestUpdate();
+
+      expect(update['password_reset_requested'], isTrue);
+      expect(update['password_reset_status'], 'requested');
+      expect(update['password_reset_requested_at'], isA<FieldValue>());
+      expect(
+        update.keys,
+        containsAll([
+          'password_reset_requested',
+          'password_reset_status',
+          'password_reset_requested_at',
+        ]),
+      );
+      expect(update.keys, isNot(contains('password')));
+    },
+  );
 }

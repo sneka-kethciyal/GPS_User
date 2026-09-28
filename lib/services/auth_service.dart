@@ -6,12 +6,14 @@ import '../models/tracking_schedule.dart';
 
 class AppUserProfile {
   final String username;
+  final String? role;
   final String? group;
   final String? accountStatus;
   final TrackingSchedule? schedule;
 
   const AppUserProfile({
     required this.username,
+    this.role,
     this.group,
     this.accountStatus,
     this.schedule,
@@ -57,6 +59,14 @@ class AuthService {
     return {'last_login': FieldValue.serverTimestamp()};
   }
 
+  static Map<String, dynamic> passwordResetRequestUpdate() {
+    return {
+      'password_reset_requested': true,
+      'password_reset_status': 'requested',
+      'password_reset_requested_at': FieldValue.serverTimestamp(),
+    };
+  }
+
   Future<void> _writeLastLogin(String uid) {
     return _firestore
         .collection('users')
@@ -64,9 +74,47 @@ class AuthService {
         .set(lastLoginUpdate(), SetOptions(merge: true));
   }
 
-  Future<void> sendPasswordResetEmail(String username) async {
-    final email = await resolveLoginEmail(username);
-    return _auth.sendPasswordResetEmail(email: email);
+  Future<bool> requestPasswordReset(String username) async {
+    final currentUser = _auth.currentUser;
+    DocumentReference<Map<String, dynamic>>? userReference;
+
+    if (currentUser != null) {
+      userReference = _firestore.collection('users').doc(currentUser.uid);
+    } else {
+      final trimmedUsername = username.trim();
+      final query = await _firestore
+          .collection('users')
+          .where('username', isEqualTo: trimmedUsername)
+          .limit(1)
+          .get();
+      if (query.docs.isNotEmpty) {
+        userReference = query.docs.first.reference;
+      }
+    }
+
+    if (userReference == null) {
+      throw FirebaseAuthException(
+        code: 'user-not-found',
+        message: 'No account was found for that username.',
+      );
+    }
+    final reference = userReference;
+
+    return _firestore.runTransaction((transaction) async {
+      final snapshot = await transaction.get(reference);
+      final data = snapshot.data() ?? const <String, dynamic>{};
+      final status = data['password_reset_status']?.toString().toLowerCase();
+      final isPending =
+          data['password_reset_requested'] == true && status == 'requested';
+      if (isPending) return true;
+
+      transaction.set(
+        reference,
+        passwordResetRequestUpdate(),
+        SetOptions(merge: true),
+      );
+      return false;
+    });
   }
 
   Future<void> logout() => _auth.signOut();
@@ -194,6 +242,7 @@ class AuthService {
 
     return AppUserProfile(
       username: username.isNotEmpty ? username : 'Unknown user',
+      role: data['role']?.toString(),
       group: groupValue?.toString(),
       accountStatus: statusValue?.toString(),
       schedule: rawSchedule is Map<String, dynamic>

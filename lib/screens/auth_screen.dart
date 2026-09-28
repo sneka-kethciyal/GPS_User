@@ -52,8 +52,12 @@ class _AuthScreenState extends State<AuthScreen> {
     }
     setState(() => _isBusy = true);
     try {
-      await _authService.sendPasswordResetEmail(username);
-      _showMessage('Password reset instructions sent.');
+      final isPending = await _authService.requestPasswordReset(username);
+      _showMessage(
+        isPending
+            ? 'Your password reset request is already pending.'
+            : 'Password reset request sent to administrator.',
+      );
     } on FirebaseAuthException catch (error) {
       _showMessage(_authErrorMessage(error));
     } finally {

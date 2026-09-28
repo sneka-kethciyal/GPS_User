@@ -20,6 +20,8 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
   final _amountController = TextEditingController();
   final _creditController = TextEditingController();
 
+  LocationProvider? _locationProvider;
+
   final currencyFormat = NumberFormat.currency(
     locale: 'en_IN',
     symbol: '₹',
@@ -27,11 +29,37 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
   );
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      _locationProvider = Provider.of<LocationProvider>(context, listen: false);
+      _locationProvider!.addListener(_showTrackingNotification);
+      await _locationProvider!.requestBackgroundTrackingPermission(context);
+      if (!mounted) return;
+      await _locationProvider!.initializeForCurrentUser();
+      _showTrackingNotification();
+    });
+  }
+
+  @override
   void dispose() {
+    _locationProvider?.removeListener(_showTrackingNotification);
     _itemNameController.dispose();
     _amountController.dispose();
     _creditController.dispose();
     super.dispose();
+  }
+
+  void _showTrackingNotification() {
+    final message = _locationProvider?.consumeTrackingNotification();
+    if (message == null || !mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(message)));
+    });
   }
 
   void _showSetCreditDialog(BuildContext context, double currentCredit) {
@@ -258,8 +286,6 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
   @override
   Widget build(BuildContext context) {
     final expenseProvider = Provider.of<ExpenseProvider>(context);
-    final locationProvider = Provider.of<LocationProvider>(context);
-
     final selectedDate =
         DateTime.tryParse('${expenseProvider.selectedMonth}-01') ??
         DateTime.now();
@@ -333,22 +359,18 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
               _buildMonthHeader(context, expenseProvider, monthLabel),
               const SizedBox(height: 12),
 
-              // 2. Geo Tracking Status Banner
-              _buildGeoStatusChip(context, locationProvider),
-              const SizedBox(height: 16),
-
-              // 3. Balance Summary Card (Pastel Gradient with dark readable typography)
+              // 2. Balance Summary Card (Pastel Gradient with dark readable typography)
               _buildBalanceSummaryCard(context, expenseProvider),
               const SizedBox(height: 20),
 
               _buildTodaySummary(expenseProvider),
               const SizedBox(height: 20),
 
-              // 4. Add Expense Input Card
+              // 3. Add Expense Input Card
               _buildExpenseInputCard(context, expenseProvider),
               const SizedBox(height: 24),
 
-              // 5. Monthly Expenses List Header
+              // 4. Monthly Expenses List Header
               Row(
                 children: [
                   Expanded(
@@ -386,7 +408,7 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
               ),
               const SizedBox(height: 12),
 
-              // 6. Expense Items List
+              // 5. Expense Items List
               _buildExpenseList(expenseProvider, todayExpenses),
               const SizedBox(height: 16),
             ],
@@ -536,6 +558,8 @@ class _ExpenseTrackerScreenState extends State<ExpenseTrackerScreen> {
     );
   }
 
+  // Kept out of the home layout while background tracking remains provider-owned.
+  // ignore: unused_element
   Widget _buildGeoStatusChip(
     BuildContext context,
     LocationProvider locProvider,

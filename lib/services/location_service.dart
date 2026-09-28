@@ -1,4 +1,5 @@
 import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -7,6 +8,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:uuid/uuid.dart';
 import 'package:workmanager/workmanager.dart';
+
 import '../firebase_options.dart';
 import '../models/geo_location.dart';
 import '../models/tracking_schedule.dart';
@@ -34,7 +36,10 @@ Future<TrackingSchedule?> _loadSchedule(String userId) async {
   }
 }
 
-Future<bool> isWithinScheduleForUser(String userId, [DateTime? checkTime]) async {
+Future<bool> isWithinScheduleForUser(
+  String userId, [
+  DateTime? checkTime,
+]) async {
   final schedule = await _loadSchedule(userId);
   if (schedule == null) return false;
   return schedule.isWithinAllowedSchedule(checkTime);
@@ -51,7 +56,9 @@ void callbackDispatcher() {
     try {
       // If foreground task is already running, skip to avoid engine collision
       if (await FlutterForegroundTask.isRunningService) {
-        debugPrint("[Workmanager] Foreground service is active; skipping duplicate run.");
+        debugPrint(
+          "[Workmanager] Foreground service is active; skipping duplicate run.",
+        );
         return true;
       }
 
@@ -59,7 +66,8 @@ void callbackDispatcher() {
 
       if (taskName == geoTrackingTaskKey ||
           taskName == Workmanager.iOSBackgroundTask) {
-        final userId = inputData?['user_id'] as String? ??
+        final userId =
+            inputData?['user_id'] as String? ??
             await LocationService.resolveUserId();
         if (userId == null || userId.isEmpty) {
           debugPrint("[Workmanager] No user ID available; completing task.");
@@ -69,7 +77,9 @@ void callbackDispatcher() {
         // ── STRICT SCHEDULE GATE ──────────────────────────────────────────
         final allowed = await isWithinScheduleForUser(userId);
         if (!allowed) {
-          debugPrint("[Workmanager] Outside schedule – skipping location capture.");
+          debugPrint(
+            "[Workmanager] Outside schedule – skipping location capture.",
+          );
           return true;
         }
 
@@ -110,7 +120,9 @@ class _GpsTaskHandler extends TaskHandler {
 
     // ── STRICT SCHEDULE GATE ──────────────────────────────────────────────
     if (userId == null || !await isWithinScheduleForUser(userId)) {
-      debugPrint('[ForegroundTask] Outside schedule at start – stopping service.');
+      debugPrint(
+        '[ForegroundTask] Outside schedule at start – stopping service.',
+      );
       await FlutterForegroundTask.stopService();
       return;
     }
@@ -133,7 +145,9 @@ class _GpsTaskHandler extends TaskHandler {
 
       // ── STRICT SCHEDULE GATE every capture ──────────────────────────────
       if (!await isWithinScheduleForUser(uId)) {
-        debugPrint('[ForegroundTask] Schedule ended – stopping service from timer.');
+        debugPrint(
+          '[ForegroundTask] Schedule ended – stopping service from timer.',
+        );
         _captureTimer?.cancel();
         _endCheckTimer?.cancel();
         await FlutterForegroundTask.stopService();
@@ -153,7 +167,9 @@ class _GpsTaskHandler extends TaskHandler {
     _endCheckTimer = Timer.periodic(const Duration(minutes: 1), (_) async {
       final uId = await LocationService.resolveUserId() ?? userId;
       if (!await isWithinScheduleForUser(uId)) {
-        debugPrint('[ForegroundTask] Schedule ended (end-check timer) – stopping service.');
+        debugPrint(
+          '[ForegroundTask] Schedule ended (end-check timer) – stopping service.',
+        );
         _captureTimer?.cancel();
         _endCheckTimer?.cancel();
         await FlutterForegroundTask.stopService();
@@ -169,7 +185,9 @@ class _GpsTaskHandler extends TaskHandler {
 
     // ── STRICT SCHEDULE GATE ──────────────────────────────────────────────
     if (!await isWithinScheduleForUser(uId)) {
-      debugPrint('[ForegroundTask] onRepeatEvent outside schedule – stopping service.');
+      debugPrint(
+        '[ForegroundTask] onRepeatEvent outside schedule – stopping service.',
+      );
       await FlutterForegroundTask.stopService();
       return;
     }
@@ -182,7 +200,9 @@ class _GpsTaskHandler extends TaskHandler {
 
   @override
   Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
-    debugPrint('[ForegroundTask] Task isolate destroyed (isTimeout: $isTimeout).');
+    debugPrint(
+      '[ForegroundTask] Task isolate destroyed (isTimeout: $isTimeout).',
+    );
     _captureTimer?.cancel();
     _captureTimer = null;
     _endCheckTimer?.cancel();
@@ -213,10 +233,13 @@ class LocationService {
   // ── Resolve user ID across isolates ────────────────────────────────────────
 
   static Future<String?> resolveUserId([String? explicitUserId]) async {
-    if (explicitUserId != null && explicitUserId.isNotEmpty) return explicitUserId;
+    if (explicitUserId != null && explicitUserId.isNotEmpty)
+      return explicitUserId;
     final authUid = FirebaseAuth.instance.currentUser?.uid;
     if (authUid != null && authUid.isNotEmpty) return authUid;
-    final storedUid = await DatabaseHelper.instance.getSetting('current_user_id');
+    final storedUid = await DatabaseHelper.instance.getSetting(
+      'current_user_id',
+    );
     if (storedUid != null && storedUid.isNotEmpty) return storedUid;
     return null;
   }
@@ -241,7 +264,8 @@ class LocationService {
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'gps_tracking_channel',
         channelName: 'GPS Tracking',
-        channelDescription: 'Tracks your location during your configured schedule.',
+        channelDescription:
+            'Tracks your location during your configured schedule.',
         channelImportance: NotificationChannelImportance.LOW,
         priority: NotificationPriority.LOW,
         enableVibration: false,
@@ -251,7 +275,9 @@ class LocationService {
         showNotification: false,
       ),
       foregroundTaskOptions: ForegroundTaskOptions(
-        eventAction: ForegroundTaskEventAction.repeat(geoCaptureInterval.inMilliseconds),
+        eventAction: ForegroundTaskEventAction.repeat(
+          geoCaptureInterval.inMilliseconds,
+        ),
         autoRunOnBoot: true,
         allowWakeLock: true,
         allowWifiLock: true,
@@ -263,8 +289,7 @@ class LocationService {
 
   Future<bool> checkPermission() async {
     final permission = await Geolocator.checkPermission();
-    return permission == LocationPermission.always ||
-        permission == LocationPermission.whileInUse;
+    return permission == LocationPermission.always;
   }
 
   // ── Start tracking ─────────────────────────────────────────────────────────
@@ -273,13 +298,16 @@ class LocationService {
   Future<String?> startTracking([String? explicitUserId]) async {
     if (_isTracking) return null;
 
-    final userId = explicitUserId ??
+    final userId =
+        explicitUserId ??
         FirebaseAuth.instance.currentUser?.uid ??
         await DatabaseHelper.instance.getSetting('current_user_id');
 
     // ── STRICT SCHEDULE GATE ──────────────────────────────────────────────
     if (userId != null && userId.isNotEmpty) {
-      final schedule = await DatabaseHelper.instance.getTrackingSchedule(userId);
+      final schedule = await DatabaseHelper.instance.getTrackingSchedule(
+        userId,
+      );
       final result = schedule.validateSchedule();
       if (!result.isWithinSchedule) {
         debugPrint('[LocationService] Start refused: ${result.statusMessage}');
@@ -322,7 +350,9 @@ class LocationService {
         inputData: userId != null ? {'user_id': userId} : null,
         constraints: Constraints(networkType: NetworkType.notRequired),
       );
-      debugPrint('[LocationService] Registered WorkManager 15-min fallback task.');
+      debugPrint(
+        '[LocationService] Registered WorkManager 15-min fallback task.',
+      );
     } catch (e) {
       debugPrint('[LocationService] Failed to register WorkManager task: $e');
     }
@@ -340,7 +370,9 @@ class LocationService {
     if (userId == null) return;
     final allowed = await isWithinScheduleForUser(userId);
     if (!allowed) {
-      debugPrint('[LocationService] ensureForegroundTracking: outside schedule, stopping.');
+      debugPrint(
+        '[LocationService] ensureForegroundTracking: outside schedule, stopping.',
+      );
       await stopTracking();
       return;
     }
@@ -379,7 +411,9 @@ class LocationService {
       final status = await Permission.notification.status;
       if (status.isDenied) await Permission.notification.request();
     } catch (e) {
-      debugPrint('[LocationService] Notification permission request failed: $e');
+      debugPrint(
+        '[LocationService] Notification permission request failed: $e',
+      );
     }
   }
 
@@ -387,8 +421,10 @@ class LocationService {
 
   Future<void> _requestBatteryOptimizationExemption() async {
     try {
-      final isIgnoring = await FlutterForegroundTask.isIgnoringBatteryOptimizations;
-      if (!isIgnoring) await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+      final isIgnoring =
+          await FlutterForegroundTask.isIgnoringBatteryOptimizations;
+      if (!isIgnoring)
+        await FlutterForegroundTask.requestIgnoreBatteryOptimization();
     } catch (e) {
       debugPrint('[LocationService] Battery optimization request failed: $e');
     }
@@ -403,20 +439,25 @@ class LocationService {
     try {
       final resolvedUserId = await resolveUserId(userId);
       if (resolvedUserId == null || resolvedUserId.isEmpty) {
-        debugPrint('[LocationService] Cannot capture location: no resolved userId.');
+        debugPrint(
+          '[LocationService] Cannot capture location: no resolved userId.',
+        );
         return;
       }
 
       // ── STRICT SCHEDULE GATE ──────────────────────────────────────────────
       if (!await isWithinScheduleForUser(resolvedUserId)) {
-        debugPrint('[LocationService] persistCurrentLocation: outside schedule – skipping.');
+        debugPrint(
+          '[LocationService] persistCurrentLocation: outside schedule – skipping.',
+        );
         return;
       }
 
       final permission = await Geolocator.checkPermission();
-      if (permission != LocationPermission.always &&
-          permission != LocationPermission.whileInUse) {
-        debugPrint('[LocationService] No location permission – skipping capture.');
+      if (permission != LocationPermission.always) {
+        debugPrint(
+          '[LocationService] No location permission – skipping capture.',
+        );
         return;
       }
 
@@ -451,32 +492,44 @@ class LocationService {
     try {
       final resolvedUserId = await resolveUserId(userId);
       if (resolvedUserId == null || resolvedUserId.isEmpty) {
-        debugPrint('[LocationService] Cannot persist position: no resolved userId.');
+        debugPrint(
+          '[LocationService] Cannot persist position: no resolved userId.',
+        );
         return;
       }
 
       // ── STRICT SCHEDULE GATE ──────────────────────────────────────────────
       if (!await isWithinScheduleForUser(resolvedUserId)) {
-        debugPrint('[LocationService] persistPosition: outside schedule – discarding.');
+        debugPrint(
+          '[LocationService] persistPosition: outside schedule – discarding.',
+        );
         return;
       }
 
       final captureTime = (timestamp ?? DateTime.now()).toUtc();
 
       // ── Duplicate / throttle prevention ──────────────────────────────────
-      final lastRecord = await DatabaseHelper.instance.getLatestGeoLocation(resolvedUserId);
+      final lastRecord = await DatabaseHelper.instance.getLatestGeoLocation(
+        resolvedUserId,
+      );
       if (lastRecord != null) {
-        final timeDiff = captureTime.difference(lastRecord.timestamp.toUtc()).abs();
+        final timeDiff = captureTime
+            .difference(lastRecord.timestamp.toUtc())
+            .abs();
 
         if (timeDiff < const Duration(seconds: 30) &&
             (lastRecord.latitude - latitude).abs() < 0.00001 &&
             (lastRecord.longitude - longitude).abs() < 0.00001) {
-          debugPrint('[LocationService] Skipping identical duplicate location.');
+          debugPrint(
+            '[LocationService] Skipping identical duplicate location.',
+          );
           return;
         }
 
         if (!ignoreThrottle && timeDiff < geoCaptureMinGap) {
-          debugPrint('[LocationService] Throttle: last point was ${timeDiff.inMinutes} min ago.');
+          debugPrint(
+            '[LocationService] Throttle: last point was ${timeDiff.inMinutes} min ago.',
+          );
           return;
         }
       }

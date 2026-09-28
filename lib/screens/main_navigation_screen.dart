@@ -62,112 +62,22 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 ),
               ),
               const SizedBox(height: 16),
-              _ProfileRow(label: 'Username', value: profile?.username ?? FirebaseAuth.instance.currentUser?.email ?? 'Unknown'),
-              _ProfileRow(label: 'Group', value: profile?.group ?? 'Not assigned'),
               _ProfileRow(
-                label: 'Assigned Schedule',
-                value: profile?.schedule != null
-                    ? '${profile!.schedule!.formattedDaysSummary} · ${profile.schedule!.formattedTimeRange}'
-                    : 'Not assigned',
+                label: 'Username',
+                value:
+                    profile?.username ??
+                    FirebaseAuth.instance.currentUser?.email ??
+                    'Unknown',
               ),
-              const SizedBox(height: 20),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  onPressed: () {
-                    Navigator.pop(sheetContext);
-                    _showChangePasswordDialog();
-                  },
-                  icon: const Icon(Icons.lock_reset_rounded),
-                  label: const Text('Change Password'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppTheme.pastelLavender,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                  ),
-                ),
+              _ProfileRow(
+                label: 'Role',
+                value: profile?.role ?? 'Not assigned',
               ),
             ],
           ),
         );
       },
     );
-  }
-
-  Future<void> _showChangePasswordDialog() async {
-    final currentPasswordController = TextEditingController();
-    final newPasswordController = TextEditingController();
-    final confirmPasswordController = TextEditingController();
-
-    final result = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          title: const Text('Change Password'),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: currentPasswordController,
-                  obscureText: true,
-                  decoration: const InputDecoration(labelText: 'Current Password'),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: newPasswordController,
-                  obscureText: true,
-                  decoration: const InputDecoration(labelText: 'New Password'),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: confirmPasswordController,
-                  obscureText: true,
-                  decoration: const InputDecoration(labelText: 'Confirm New Password'),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('Update'),
-            ),
-          ],
-        );
-      },
-    );
-
-    if (result != true) return;
-
-    try {
-      await AuthService().updateUserProfilePassword(
-        currentPassword: currentPasswordController.text,
-        newPassword: newPasswordController.text,
-        confirmPassword: confirmPasswordController.text,
-      );
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Password updated successfully.')),
-      );
-    } on FirebaseAuthException catch (error) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message ?? 'Unable to update password.')),
-      );
-    } catch (_) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Unable to update password. Please try again.')),
-      );
-    }
   }
 
   @override

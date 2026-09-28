@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:geolocator/geolocator.dart';
+
 import '../models/geo_location.dart';
 import '../models/tracking_schedule.dart';
 import '../services/database_helper.dart';
@@ -21,6 +23,9 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
   bool _isCapturingNow = false;
   TrackingSchedule _schedule = TrackingSchedule.defaultSchedule();
   bool _scheduleLoaded = false;
+  bool? _lastReportedTrackingEnabled;
+  bool? _lastReportedActive;
+  final List<String> _trackingNotifications = [];
 
   bool get isTrackingEnabled => _isTrackingEnabled;
   bool get hasPermission => _hasPermission;
@@ -38,9 +43,51 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// Current validation result for the live schedule.
   ScheduleValidationResult get scheduleStatus => _schedule.validateSchedule();
 
+  String? consumeTrackingNotification() {
+    if (_trackingNotifications.isEmpty) return null;
+    return _trackingNotifications.removeAt(0);
+  }
+
   LocationProvider() {
     WidgetsBinding.instance.addObserver(this);
     _checkInitialStatus();
+  }
+
+  Future<void> initializeForCurrentUser() async {
+    final userId = await LocationService.resolveUserId();
+    if (userId == null || userId.isEmpty) {
+      return;
+    }
+
+    // Re-check permissions and bind the background service to the current login.
+    _hasShownDisclosure = false;
+    _isTrackingEnabled = false;
+    await _service.stopTracking();
+    await _checkInitialStatus(userId);
+  }
+
+  Future<void> requestBackgroundTrackingPermission(BuildContext context) async {
+    if (!context.mounted) return;
+
+    _hasPermission = await _service.checkPermission();
+    if (_hasShownDisclosure) return;
+
+    if (!_hasPermission) {
+      await enableTrackingWithDisclosure(context);
+    } else if (!_isTrackingEnabled) {
+      final userId = await LocationService.resolveUserId();
+      if (userId == null || userId.isEmpty) return;
+
+      _isTrackingEnabled = true;
+      await DatabaseHelper.instance.setSetting('tracking_enabled', 'true');
+      final error = await _service.startTracking(userId);
+      if (error != null) {
+        _enqueueTrackingNotification('Tracking failed: $error');
+      }
+    }
+
+    _reportTrackingState();
+    notifyListeners();
   }
 
   @override
@@ -72,34 +119,51 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
 
     _schedule = await ScheduleService.instance.loadSchedule(uid);
     _scheduleLoaded = true;
-    debugPrint('[LocationProvider] Loaded schedule for $uid -> ${_schedule.formattedDaysSummary} ${_schedule.formattedTimeRange}');
+    debugPrint(
+      '[LocationProvider] Loaded schedule for $uid -> ${_schedule.formattedDaysSummary} ${_schedule.formattedTimeRange}',
+    );
     notifyListeners();
 
-    ScheduleService.instance.listenForScheduleUpdates(uid, onChanged: (updatedSchedule) async {
-      _schedule = updatedSchedule;
-      _scheduleLoaded = true;
-      debugPrint('[LocationProvider] Firestore schedule update received for $uid: ${updatedSchedule.formattedDaysSummary} ${updatedSchedule.formattedTimeRange}');
-      notifyListeners();
+    ScheduleService.instance.listenForScheduleUpdates(
+      uid,
+      onChanged: (updatedSchedule) async {
+        _schedule = updatedSchedule;
+        _scheduleLoaded = true;
+        debugPrint(
+          '[LocationProvider] Firestore schedule update received for $uid: ${updatedSchedule.formattedDaysSummary} ${updatedSchedule.formattedTimeRange}',
+        );
+        notifyListeners();
 
-      final nowWithinSchedule = updatedSchedule.isWithinAllowedSchedule();
-      debugPrint('[LocationProvider] Current time in schedule for $uid: $nowWithinSchedule');
+        final nowWithinSchedule = updatedSchedule.isWithinAllowedSchedule();
+        debugPrint(
+          '[LocationProvider] Current time in schedule for $uid: $nowWithinSchedule',
+        );
 
-      if (_isTrackingEnabled) {
-        if (nowWithinSchedule) {
-          final error = await _service.startTracking(uid);
-          if (error != null) {
-            debugPrint('[LocationProvider] Re-start tracking after Firestore update denied: $error');
+        if (_isTrackingEnabled) {
+          if (nowWithinSchedule) {
+            final error = await _service.startTracking(uid);
+            if (error != null) {
+              debugPrint(
+                '[LocationProvider] Re-start tracking after Firestore update denied: $error',
+              );
+            }
+          } else {
+            await _service.stopTracking();
+            debugPrint(
+              '[LocationProvider] Tracking stopped because schedule update moved outside allowed window.',
+            );
           }
-        } else {
-          await _service.stopTracking();
-          debugPrint('[LocationProvider] Tracking stopped because schedule update moved outside allowed window.');
         }
-      }
-    });
+      },
+    );
   }
 
-  Future<void> saveSchedule(TrackingSchedule newSchedule, [String? userId]) async {
-    final uid = userId ??
+  Future<void> saveSchedule(
+    TrackingSchedule newSchedule, [
+    String? userId,
+  ]) async {
+    final uid =
+        userId ??
         FirebaseAuth.instance.currentUser?.uid ??
         await DatabaseHelper.instance.getSetting('current_user_id');
     if (uid == null || uid.isEmpty) return;
@@ -113,10 +177,12 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
   Future<void> refreshLocationStatus() async {
     final userId = await LocationService.resolveUserId();
     if (userId != null && userId.isNotEmpty) {
-      _latestLocation =
-          await DatabaseHelper.instance.getLatestGeoLocation(userId);
-      final unsynced =
-          await DatabaseHelper.instance.getUnsyncedGeoLocations(userId);
+      _latestLocation = await DatabaseHelper.instance.getLatestGeoLocation(
+        userId,
+      );
+      final unsynced = await DatabaseHelper.instance.getUnsyncedGeoLocations(
+        userId,
+      );
       _unsyncedLocationCount = unsynced.length;
       notifyListeners();
     }
@@ -146,13 +212,16 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _checkInitialStatus() async {
-    final trackingPref =
-        await DatabaseHelper.instance.getSetting('tracking_enabled');
+  Future<void> _checkInitialStatus([String? requestedUserId]) async {
+    final userId = requestedUserId ?? await LocationService.resolveUserId();
+    if (userId == null || userId.isEmpty) return;
+
+    await _permissionService.requestNotificationPermission();
+    final trackingPref = await DatabaseHelper.instance.getSetting(
+      'tracking_enabled',
+    );
     final isTrackingSaved = trackingPref == 'true';
     _hasPermission = await _service.checkPermission();
-
-    final userId = await LocationService.resolveUserId();
 
     // Load schedule first so gates are live immediately
     await loadSchedule(userId);
@@ -164,14 +233,47 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
       if (error != null) {
         // Outside schedule at boot – keep toggle ON but service dormant
         debugPrint('[LocationProvider] Startup outside schedule: $error');
+        _enqueueTrackingNotification('Tracking stopped: $error');
       }
     } else {
       _isTrackingEnabled = false;
       await _service.stopTracking();
     }
 
+    if (!_hasPermission) {
+      _enqueueTrackingNotification('Location permission denied');
+    } else if (!await Geolocator.isLocationServiceEnabled()) {
+      _enqueueTrackingNotification('Location services disabled');
+    }
+    _reportTrackingState();
     await refreshLocationStatus();
     notifyListeners();
+  }
+
+  void _enqueueTrackingNotification(String message) {
+    if (_trackingNotifications.isNotEmpty &&
+        _trackingNotifications.last == message) {
+      return;
+    }
+    _trackingNotifications.add(message);
+    notifyListeners();
+  }
+
+  void _reportTrackingState() {
+    if (_lastReportedTrackingEnabled != _isTrackingEnabled) {
+      _lastReportedTrackingEnabled = _isTrackingEnabled;
+      _enqueueTrackingNotification(
+        _isTrackingEnabled ? 'GPS tracking enabled' : 'GPS tracking disabled',
+      );
+    }
+
+    final isActive = isActivelyTracking;
+    if (_lastReportedActive != null && _lastReportedActive != isActive) {
+      _enqueueTrackingNotification(
+        isActive ? 'Tracking started' : 'Tracking stopped',
+      );
+    }
+    _lastReportedActive = isActive;
   }
 
   // ── Enable tracking with disclosure ───────────────────────────────────────
@@ -194,7 +296,11 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
                 color: AppTheme.pastelBlueLight,
                 borderRadius: BorderRadius.circular(14),
               ),
-              child: const Icon(Icons.location_on_rounded, color: AppTheme.pastelBlue, size: 24),
+              child: const Icon(
+                Icons.location_on_rounded,
+                color: AppTheme.pastelBlue,
+                size: 24,
+              ),
             ),
             const SizedBox(width: 12),
             const Expanded(
@@ -215,22 +321,35 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
           children: [
             Text(
               'EBT Fusion Infotech Expense Tracker collects background location data approximately every 15 minutes to log verified regional expense context.',
-              style: TextStyle(fontSize: 14, height: 1.5, color: AppTheme.textSecondary),
+              style: TextStyle(
+                fontSize: 14,
+                height: 1.5,
+                color: AppTheme.textSecondary,
+              ),
             ),
             SizedBox(height: 14),
             Text(
               '• Data is saved locally in SQLite when offline.\n• Data is securely synchronized to the company Firestore database.\n• Location is only collected during your configured schedule.\n• No map or personal route history is shown inside the application.',
-              style: TextStyle(fontSize: 13, height: 1.5, color: AppTheme.textMuted),
+              style: TextStyle(
+                fontSize: 13,
+                height: 1.5,
+                color: AppTheme.textMuted,
+              ),
             ),
           ],
         ),
-        actionsPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        actionsPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 12,
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(false),
             style: TextButton.styleFrom(
               foregroundColor: AppTheme.textSecondary,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
             ),
             child: const Text('Decline'),
           ),
@@ -239,7 +358,9 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
             style: ElevatedButton.styleFrom(
               backgroundColor: AppTheme.pastelLavender,
               foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+              ),
               elevation: 0,
             ),
             child: const Text('Accept & Allow'),
@@ -252,8 +373,8 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
 
     _hasShownDisclosure = true;
     await _permissionService.requestNotificationPermission();
-    final permissionStatus =
-        await _permissionService.requestBackgroundLocation();
+    final permissionStatus = await _permissionService
+        .requestBackgroundLocation();
 
     if (permissionStatus == BackgroundLocationPermissionStatus.granted) {
       _hasPermission = true;
@@ -267,6 +388,7 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
         // Service refused to start outside schedule – toggle stays enabled
         // but inform the caller so UI can show the schedule message
         await refreshLocationStatus();
+        _enqueueTrackingNotification('Tracking failed: $error');
         notifyListeners();
         return error;
       }
@@ -278,6 +400,7 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
 
     _hasPermission = false;
     _isTrackingEnabled = false;
+    _enqueueTrackingNotification('Location permission denied');
 
     if (!context.mounted) {
       notifyListeners();
@@ -315,12 +438,16 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
     final retry = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text(needsSettings
-            ? 'Background location required'
-            : 'Location permission denied'),
-        content: Text(needsSettings
-            ? 'Android did not show Allow all the time. Background tracking requires Settings > App > Permissions > Location > Allow all the time.'
-            : 'Location permission is required to start tracking. Please allow location access and try again.'),
+        title: Text(
+          needsSettings
+              ? 'Background location required'
+              : 'Location permission denied',
+        ),
+        content: Text(
+          needsSettings
+              ? 'Android did not show Allow all the time. Background tracking requires Settings > App > Permissions > Location > Allow all the time.'
+              : 'Location permission is required to start tracking. Please allow location access and try again.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(false),
@@ -357,6 +484,7 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
       await DatabaseHelper.instance.setSetting('tracking_enabled', 'false');
       await _service.stopTracking();
       _isTrackingEnabled = false;
+      _reportTrackingState();
       notifyListeners();
       return null;
     }
