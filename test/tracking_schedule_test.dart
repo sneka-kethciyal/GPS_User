@@ -5,6 +5,64 @@ import 'package:expense_tracker/services/auth_service.dart';
 
 void main() {
   group('TrackingSchedule Unit Tests', () {
+    test('admin group schedule honors exact local start, end, and days', () {
+      final schedule = TrackingSchedule.fromFirestore({
+        'is_enabled': true,
+        'enabled_days': [
+          'Monday',
+          'Tuesday',
+          'Wednesday',
+          'Thursday',
+          'Friday',
+        ],
+        'start_time': '09:00',
+        'end_time': '16:25',
+      });
+
+      expect(
+        schedule.isWithinAllowedSchedule(DateTime(2026, 9, 21, 8, 59)),
+        isFalse,
+      );
+      expect(
+        schedule.isWithinAllowedSchedule(DateTime(2026, 9, 21, 9, 0)),
+        isTrue,
+      );
+      expect(
+        schedule.isWithinAllowedSchedule(DateTime(2026, 9, 21, 16, 24)),
+        isTrue,
+      );
+      expect(
+        schedule.isWithinAllowedSchedule(DateTime(2026, 9, 21, 16, 25)),
+        isFalse,
+      );
+      expect(
+        schedule.isWithinAllowedSchedule(DateTime(2026, 9, 26, 10, 0)),
+        isFalse,
+      );
+      expect(
+        schedule.isWithinAllowedSchedule(DateTime(2026, 9, 27, 10, 0)),
+        isFalse,
+      );
+
+      final saturdayEnabled = TrackingSchedule.fromFirestore({
+        'enabled': true,
+        'days': [
+          'Monday',
+          'Tuesday',
+          'Wednesday',
+          'Thursday',
+          'Friday',
+          'Saturday',
+        ],
+        'start_time': '09:00',
+        'end_time': '16:25',
+      });
+      expect(
+        saturdayEnabled.isWithinAllowedSchedule(DateTime(2026, 9, 26, 10, 0)),
+        isTrue,
+      );
+    });
+
     test(
       'Standard daytime schedule validation (09:00 to 18:00 on Mon, Wed, Fri)',
       () {
@@ -220,6 +278,69 @@ void main() {
         ExpenseProvider.kolkataDateKey(DateTime.utc(2026, 9, 23, 18, 30)),
         equals('2026-09-24'),
       );
+    });
+
+    test(
+      'nextScheduleWindowStart uses Firestore times for the following day',
+      () {
+        final schedule = TrackingSchedule(
+          isEnabled: true,
+          selectedDays: const [1, 2, 3, 4, 5],
+          startHour: 10,
+          startMinute: 30,
+          endHour: 18,
+          endMinute: 30,
+        );
+
+        final fridayEnd = DateTime(2026, 9, 25, 18, 30);
+        final nextStart = schedule.nextScheduleWindowStart(fridayEnd);
+        expect(nextStart, DateTime(2026, 9, 28, 10, 30));
+      },
+    );
+
+    test('nextScheduleWindowStart returns later today before start time', () {
+      final schedule = TrackingSchedule(
+        isEnabled: true,
+        selectedDays: const [1, 2, 3, 4, 5],
+        startHour: 11,
+        startMinute: 0,
+        endHour: 16,
+        endMinute: 0,
+      );
+
+      final mondayMorning = DateTime(2026, 9, 21, 8, 15);
+      expect(
+        schedule.nextScheduleWindowStart(mondayMorning),
+        DateTime(2026, 9, 21, 11, 0),
+      );
+    });
+
+    test('schedule end uses the Firestore-defined wall-clock time', () {
+      final schedule = TrackingSchedule(
+        isEnabled: true,
+        selectedDays: const [1, 2, 3, 4, 5],
+        startHour: 10,
+        startMinute: 30,
+        endHour: 18,
+        endMinute: 30,
+      );
+      final windowStart = DateTime(2026, 9, 28, 10, 30);
+
+      final windowEnd = schedule.scheduleWindowEndForStart(windowStart);
+
+      expect(windowEnd, DateTime(2026, 9, 28, 18, 30));
+      expect(
+        TrackingSchedule.kolkataWallClockToUtc(windowEnd!),
+        DateTime.utc(2026, 9, 28, 13, 0),
+      );
+    });
+
+    test('Missing Firestore schedule fields do not infer a fixed schedule', () {
+      final schedule = TrackingSchedule.fromFirestore({'status': 'Active'});
+
+      expect(schedule.isEnabled, isFalse);
+      expect(schedule.isValid, isFalse);
+      expect(schedule.selectedDays, isEmpty);
     });
 
     test('Admin profile parsing reads active status and admin-controlled role info', () {

@@ -79,23 +79,21 @@ void main() {
     expect(update['last_login'], isA<FieldValue>());
   });
 
-  test(
-    'password reset request update contains only the admin request fields',
-    () {
-      final update = AuthService.passwordResetRequestUpdate();
+  test('password reset request document uses the admin review contract', () {
+    final update = AuthService.passwordResetRequestDocument(
+      userId: 'user-123',
+      username: 'Field.User',
+    );
 
-      expect(update['password_reset_requested'], isTrue);
-      expect(update['password_reset_status'], 'requested');
-      expect(update['password_reset_requested_at'], isA<FieldValue>());
-      expect(
-        update.keys,
-        containsAll([
-          'password_reset_requested',
-          'password_reset_status',
-          'password_reset_requested_at',
-        ]),
-      );
-      expect(update.keys, isNot(contains('password')));
-    },
-  );
+    expect(update['userId'], 'user-123');
+    expect(update['username'], 'field.user');
+    expect(update['status'], 'PENDING');
+    expect(update['createdAt'], isA<FieldValue>());
+    expect(update['updatedAt'], isA<FieldValue>());
+    expect(update.keys, isNot(contains('password')));
+    expect(
+      update.keys,
+      containsAll(['userId', 'username', 'status', 'createdAt', 'updatedAt']),
+    );
+  });
 }

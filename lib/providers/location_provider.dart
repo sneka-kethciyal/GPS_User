@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:geolocator/geolocator.dart';
 
 import '../models/geo_location.dart';
@@ -117,12 +116,24 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
     final uid = userId ?? await LocationService.resolveUserId();
     if (uid == null || uid.isEmpty) return;
 
-    _schedule = await ScheduleService.instance.loadSchedule(uid);
+    // Show the last valid SQLite copy immediately, then reconcile with the
+    // Firestore server. Background workers run the same reconciliation.
+    _schedule = await ScheduleService.instance.loadCachedSchedule(uid);
     _scheduleLoaded = true;
     debugPrint(
       '[LocationProvider] Loaded schedule for $uid -> ${_schedule.formattedDaysSummary} ${_schedule.formattedTimeRange}',
     );
+    _schedule.debugLogSchedule(userId: uid);
     notifyListeners();
+
+    final scheduleChanged = await ScheduleService.instance.syncAssignedSchedule(
+      uid,
+    );
+    if (scheduleChanged) {
+      _schedule = await ScheduleService.instance.loadCachedSchedule(uid);
+      _scheduleLoaded = true;
+      notifyListeners();
+    }
 
     ScheduleService.instance.listenForScheduleUpdates(
       uid,
@@ -132,6 +143,7 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
         debugPrint(
           '[LocationProvider] Firestore schedule update received for $uid: ${updatedSchedule.formattedDaysSummary} ${updatedSchedule.formattedTimeRange}',
         );
+        updatedSchedule.debugLogSchedule(userId: uid);
         notifyListeners();
 
         final nowWithinSchedule = updatedSchedule.isWithinAllowedSchedule();
@@ -140,17 +152,14 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
         );
 
         if (_isTrackingEnabled) {
-          if (nowWithinSchedule) {
-            final error = await _service.startTracking(uid);
-            if (error != null) {
-              debugPrint(
-                '[LocationProvider] Re-start tracking after Firestore update denied: $error',
-              );
-            }
-          } else {
-            await _service.stopTracking();
+          final error = await _service.activateScheduledTracking(uid);
+          if (error != null) {
             debugPrint(
-              '[LocationProvider] Tracking stopped because schedule update moved outside allowed window.',
+              '[LocationProvider] Schedule update could not arm tracking: $error',
+            );
+          } else if (!nowWithinSchedule) {
+            debugPrint(
+              '[LocationProvider] Recalculated next Firestore start after admin schedule update.',
             );
           }
         }
@@ -163,9 +172,7 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
     String? userId,
   ]) async {
     final uid =
-        userId ??
-        FirebaseAuth.instance.currentUser?.uid ??
-        await DatabaseHelper.instance.getSetting('current_user_id');
+        userId ?? await DatabaseHelper.instance.getSetting('current_user_id');
     if (uid == null || uid.isEmpty) return;
     await ScheduleService.instance.saveSchedule(uid, newSchedule);
     _schedule = newSchedule;
@@ -216,7 +223,6 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
     final userId = requestedUserId ?? await LocationService.resolveUserId();
     if (userId == null || userId.isEmpty) return;
 
-    await _permissionService.requestNotificationPermission();
     final trackingPref = await DatabaseHelper.instance.getSetting(
       'tracking_enabled',
     );
@@ -228,12 +234,14 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
 
     if (_hasPermission && isTrackingSaved) {
       _isTrackingEnabled = true;
-      // startTracking internally checks the schedule
-      final error = await _service.startTracking(userId);
+      final error = await _service.activateScheduledTracking(userId);
       if (error != null) {
-        // Outside schedule at boot – keep toggle ON but service dormant
-        debugPrint('[LocationProvider] Startup outside schedule: $error');
+        debugPrint('[LocationProvider] Startup tracking arm failed: $error');
         _enqueueTrackingNotification('Tracking stopped: $error');
+      } else if (!_schedule.isWithinAllowedSchedule()) {
+        debugPrint(
+          '[LocationProvider] Startup armed — waiting for next Firestore schedule start.',
+        );
       }
     } else {
       _isTrackingEnabled = false;
@@ -380,7 +388,9 @@ class LocationProvider extends ChangeNotifier with WidgetsBindingObserver {
       _hasPermission = true;
       _isTrackingEnabled = true;
       await DatabaseHelper.instance.setSetting('tracking_enabled', 'true');
-      final userId = FirebaseAuth.instance.currentUser?.uid;
+      final userId = await DatabaseHelper.instance.getSetting(
+        'current_user_id',
+      );
 
       // ── STRICT SCHEDULE GATE ──────────────────────────────────────────────
       final error = await _service.startTracking(userId);

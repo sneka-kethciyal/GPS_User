@@ -1,4 +1,3 @@
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
 import 'expense_tracker_screen.dart';
@@ -25,9 +24,182 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     return AuthService().loadCurrentUserProfile();
   }
 
+  Future<void> _showChangePasswordDialog() async {
+    if (!mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    final formKey = GlobalKey<FormState>();
+    final currentPasswordController = TextEditingController();
+    final newPasswordController = TextEditingController();
+    final confirmPasswordController = TextEditingController();
+    var obscureNew = true;
+    var obscureConfirm = true;
+    var isSubmitting = false;
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            Future<void> submit() async {
+              if (!(formKey.currentState?.validate() ?? false)) return;
+              setDialogState(() => isSubmitting = true);
+              try {
+                await AuthService().changeManagedPassword(
+                  currentPassword: currentPasswordController.text,
+                  newPassword: newPasswordController.text,
+                  confirmPassword: confirmPasswordController.text,
+                );
+                if (!context.mounted) return;
+                Navigator.of(context).pop();
+                messenger.showSnackBar(
+                  const SnackBar(
+                    content: Text('Password updated successfully.'),
+                  ),
+                );
+              } on ManagedAuthException catch (error) {
+                if (!context.mounted) return;
+                messenger.showSnackBar(SnackBar(content: Text(error.message)));
+              } catch (_) {
+                if (!context.mounted) return;
+                messenger.showSnackBar(
+                  const SnackBar(
+                    content: Text(
+                      'Could not update password. Please try again.',
+                    ),
+                  ),
+                );
+              } finally {
+                newPasswordController.clear();
+                confirmPasswordController.clear();
+                currentPasswordController.clear();
+                if (context.mounted) {
+                  setDialogState(() => isSubmitting = false);
+                }
+              }
+            }
+
+            return AlertDialog(
+              title: const Text('Change password'),
+              content: Form(
+                key: formKey,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextFormField(
+                      controller: currentPasswordController,
+                      enabled: !isSubmitting,
+                      obscureText: true,
+                      autofillHints: const [AutofillHints.password],
+                      validator: AuthService.validateLoginPassword,
+                      decoration: const InputDecoration(
+                        labelText: 'Current password',
+                        prefixIcon: Icon(Icons.lock_outline_rounded),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: newPasswordController,
+                      enabled: !isSubmitting,
+                      obscureText: obscureNew,
+                      autofillHints: const [AutofillHints.newPassword],
+                      validator: AuthService.validateNewPassword,
+                      decoration: InputDecoration(
+                        labelText: 'New password',
+                        prefixIcon: const Icon(Icons.lock_outline_rounded),
+                        suffixIcon: IconButton(
+                          onPressed: () =>
+                              setDialogState(() => obscureNew = !obscureNew),
+                          icon: Icon(
+                            obscureNew
+                                ? Icons.visibility_outlined
+                                : Icons.visibility_off_outlined,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: confirmPasswordController,
+                      enabled: !isSubmitting,
+                      obscureText: obscureConfirm,
+                      autofillHints: const [AutofillHints.newPassword],
+                      validator: (value) {
+                        if ((value ?? '').trim().isEmpty) {
+                          return 'Confirm your new password';
+                        }
+                        if (value!.trim() !=
+                            newPasswordController.text.trim()) {
+                          return 'Passwords do not match';
+                        }
+                        return null;
+                      },
+                      onFieldSubmitted: (_) => submit(),
+                      decoration: InputDecoration(
+                        labelText: 'Confirm password',
+                        prefixIcon: const Icon(Icons.lock_outline_rounded),
+                        suffixIcon: IconButton(
+                          onPressed: () => setDialogState(
+                            () => obscureConfirm = !obscureConfirm,
+                          ),
+                          icon: Icon(
+                            obscureConfirm
+                                ? Icons.visibility_outlined
+                                : Icons.visibility_off_outlined,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: isSubmitting
+                      ? null
+                      : () => Navigator.of(context).pop(),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: isSubmitting ? null : submit,
+                  child: isSubmitting
+                      ? const SizedBox.square(
+                          dimension: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Update password'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    newPasswordController.dispose();
+    confirmPasswordController.dispose();
+    currentPasswordController.dispose();
+  }
+
+  String? _passwordResetStatusMessage(PasswordResetRequestStatus? status) {
+    if (status == null) return null;
+    if (status.isPending) {
+      return 'Password reset pending admin review.';
+    }
+    if (status.isCompleted) {
+      return 'Your password reset was completed by an administrator.';
+    }
+    if (status.isRejected) {
+      return 'Your password reset request was rejected. Contact your administrator.';
+    }
+    return null;
+  }
+
   Future<void> _showProfileSheet() async {
     final profile = await _loadProfile();
+    final resetStatus = await AuthService().loadPasswordResetRequestStatus();
     if (!mounted) return;
+
+    final resetMessage = _passwordResetStatusMessage(resetStatus);
 
     showModalBottomSheet(
       context: context,
@@ -64,14 +236,38 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               const SizedBox(height: 16),
               _ProfileRow(
                 label: 'Username',
-                value:
-                    profile?.username ??
-                    FirebaseAuth.instance.currentUser?.email ??
-                    'Unknown',
+                value: profile?.username ?? 'Unknown',
               ),
               _ProfileRow(
                 label: 'Role',
                 value: profile?.role ?? 'Not assigned',
+              ),
+              if (resetMessage != null) ...[
+                const SizedBox(height: 4),
+                Text(
+                  resetMessage,
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: resetStatus!.isRejected
+                        ? Colors.red.shade700
+                        : resetStatus.isCompleted
+                        ? Colors.green.shade700
+                        : AppTheme.textSecondary,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.of(sheetContext).pop();
+                    _showChangePasswordDialog();
+                  },
+                  icon: const Icon(Icons.password_rounded),
+                  label: const Text('Change password'),
+                ),
               ),
             ],
           ),

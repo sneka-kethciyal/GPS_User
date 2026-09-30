@@ -6,120 +6,317 @@ import 'package:flutter/foundation.dart';
 import '../models/tracking_schedule.dart';
 import 'database_helper.dart';
 
-/// Service responsible for persisting and synchronising the user's
-/// TrackingSchedule between local SQLite and Firebase Firestore.
+/// Resolves a managed user's group schedule and keeps the last valid copy in
+/// app_settings (the existing SQLite key/value table).
 class ScheduleService {
   static final ScheduleService instance = ScheduleService._init();
   ScheduleService._init();
 
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  final List<StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>> _listeners = [];
+  final List<StreamSubscription<dynamic>> _listeners = [];
   String? _activeUserId;
 
-  DocumentReference<Map<String, dynamic>> _scheduleRef(String userId) =>
-      _firestore.collection('users').doc(userId).collection('settings').doc('tracking_schedule');
+  String _metaKey(String key, String userId) => 'schedule_${key}_$userId';
 
-  DocumentReference<Map<String, dynamic>> _userRef(String userId) =>
-      _firestore.collection('users').doc(userId);
+  Future<QuerySnapshot<Map<String, dynamic>>?> _queryManagedUser(
+    String userId, {
+    Source source = Source.server,
+  }) async {
+    final username = await DatabaseHelper.instance.getSetting(
+      'current_username',
+    );
+    if (username == null || username.trim().isEmpty) return null;
+    final query = _firestore
+        .collection('users')
+        .where('username', isEqualTo: username.trim().toLowerCase())
+        .limit(1);
+    final result = await query.get(GetOptions(source: source));
+    if (result.docs.isEmpty || result.docs.first.id != userId) return null;
+    return result;
+  }
 
-  Map<String, dynamic>? _scheduleMapFromUser(Map<String, dynamic> userData) {
-    final nested = userData['assigned_schedule'] ??
-        userData['tracking_schedule'] ??
-        userData['schedule'];
+  Future<String?> cachedAccountStatus(String userId) =>
+      DatabaseHelper.instance.getSetting(_metaKey('account_status', userId));
+
+  Future<TrackingSchedule> loadCachedSchedule(String userId) async =>
+      DatabaseHelper.instance.getTrackingSchedule(userId);
+
+  Future<bool> _clearMissingAssignment(
+    String userId, {
+    String groupId = '',
+    String groupName = '',
+    String scheduleId = '',
+  }) async {
+    final db = DatabaseHelper.instance;
+    final local = await db.getTrackingSchedule(userId);
+    final changed = local.isEnabled || local.isValid;
+    if (changed) {
+      await db.saveTrackingSchedule(userId, TrackingSchedule.defaultSchedule());
+    }
+    await db.setSetting(_metaKey('group_id', userId), groupId);
+    await db.setSetting(_metaKey('group_name', userId), groupName);
+    await db.setSetting(_metaKey('schedule_id', userId), scheduleId);
+    await db.setSetting(
+      _metaKey('last_schedule_sync_at', userId),
+      DateTime.now().toUtc().toIso8601String(),
+    );
+    return changed;
+  }
+
+  /// Reads the managed user and assigned group's existing schedule documents
+  /// from the Firestore server. A failed server read leaves SQLite untouched.
+  Future<bool> syncAssignedSchedule(String userId) async {
+    if (userId.isEmpty) return false;
+    debugPrint('[SCHEDULE SYNC] Checking Firestore schedule for $userId');
+
+    try {
+      final userSnapshot = await _queryManagedUser(userId);
+      final userData = userSnapshot?.docs.first.data();
+      if (userData == null) return false;
+
+      final statusValue =
+          userData['account_status'] ??
+          userData['status'] ??
+          userData['accountStatus'];
+      final accountStatus = statusValue is bool
+          ? (statusValue ? 'active' : 'inactive')
+          : (statusValue ?? '').toString().trim().toLowerCase();
+      await DatabaseHelper.instance.setSetting(
+        _metaKey('account_status', userId),
+        accountStatus,
+      );
+
+      final groupValue =
+          userData['group_id'] ??
+          userData['groupId'] ??
+          userData['group'] ??
+          userData['user_group'] ??
+          userData['group_name'];
+      final groupId = groupValue is Map
+          ? (groupValue['id'] ?? groupValue['group_id'] ?? groupValue['name'])
+                ?.toString()
+                .trim()
+          : groupValue?.toString().trim();
+      if (groupId == null || groupId.isEmpty) {
+        debugPrint('[SCHEDULE SYNC] No assigned group for $userId');
+        return await _clearMissingAssignment(userId);
+      }
+
+      final groupSnapshot = await _firestore
+          .collection('groups')
+          .doc(groupId)
+          .get(const GetOptions(source: Source.server));
+      final groupData = groupSnapshot.data();
+      if (groupData == null) {
+        debugPrint('[SCHEDULE SYNC] Assigned group $groupId was not found');
+        return await _clearMissingAssignment(userId, groupId: groupId);
+      }
+
+      final groupName =
+          (groupData['name'] ??
+                  groupData['group_name'] ??
+                  (groupValue is Map ? groupValue['name'] : null) ??
+                  groupId)
+              .toString();
+      final scheduleId =
+          (groupData['default_schedule_id'] ??
+                  groupData['schedule_id'] ??
+                  groupData['tracking_schedule_id'])
+              ?.toString()
+              .trim();
+
+      Map<String, dynamic>? scheduleData;
+      if (scheduleId != null && scheduleId.isNotEmpty) {
+        final scheduleSnapshot = await _firestore
+            .collection('schedules')
+            .doc(scheduleId)
+            .get(const GetOptions(source: Source.server));
+        scheduleData = scheduleSnapshot.data();
+      }
+
+      // Some existing group documents carry the schedule fields directly.
+      scheduleData ??= _embeddedSchedule(groupData);
+      if (scheduleData == null) {
+        debugPrint('[SCHEDULE SYNC] Group $groupId has no schedule');
+        return await _clearMissingAssignment(
+          userId,
+          groupId: groupId,
+          groupName: groupName,
+          scheduleId: scheduleId ?? '',
+        );
+      }
+
+      var remote = TrackingSchedule.fromFirestore(scheduleData);
+      remote = remote.copyWith(
+        lastUpdated:
+            remote.lastUpdated ??
+            TrackingSchedule.fromFirestore(groupData).lastUpdated,
+      );
+
+      final db = DatabaseHelper.instance;
+      final local = await db.getTrackingSchedule(userId);
+      final cachedGroupId = await db.getSetting(_metaKey('group_id', userId));
+      final cachedScheduleId = await db.getSetting(
+        _metaKey('schedule_id', userId),
+      );
+      final assignmentChanged =
+          cachedGroupId != groupId || cachedScheduleId != (scheduleId ?? '');
+      final remoteVersion = remote.lastUpdated;
+      final localVersion = local.lastUpdated;
+      final versionIsNewer =
+          remoteVersion != null &&
+          (localVersion == null || remoteVersion.isAfter(localVersion));
+      final valuesChanged = !_sameSchedule(local, remote);
+      final firstCache = localVersion == null && !local.isValid;
+      final rawEnabled = scheduleData['is_enabled'] ?? scheduleData['enabled'];
+      final rawStatus =
+          (scheduleData['schedule_status'] ?? scheduleData['status'])
+              ?.toString()
+              .trim()
+              .toLowerCase();
+      final explicitlyDisabled =
+          rawEnabled == false ||
+          rawEnabled == 0 ||
+          rawEnabled == '0' ||
+          rawEnabled == 'false' ||
+          (rawStatus != null &&
+              !const {'active', 'enabled', 'approved'}.contains(rawStatus));
+      final shouldReplace =
+          (remote.isValid || explicitlyDisabled || versionIsNewer) &&
+          (assignmentChanged ||
+              versionIsNewer ||
+              firstCache ||
+              (remoteVersion == null && valuesChanged));
+
+      debugPrint(
+        '[SCHEDULE SYNC] Firestore version: ${remoteVersion ?? 'unversioned'}; '
+        'SQLite version: ${localVersion ?? 'unversioned'}',
+      );
+      if (shouldReplace) {
+        final effective = remote.isValid
+            ? remote
+            : TrackingSchedule(
+                isEnabled: false,
+                selectedDays: const [],
+                lastUpdated: remoteVersion,
+              );
+        await db.saveTrackingSchedule(userId, effective);
+        debugPrint('[SCHEDULE SYNC] SQLite schedule updated');
+      } else {
+        debugPrint('[SCHEDULE SYNC] SQLite schedule is current');
+      }
+
+      await db.setSetting(_metaKey('group_id', userId), groupId);
+      await db.setSetting(_metaKey('group_name', userId), groupName);
+      await db.setSetting(_metaKey('schedule_id', userId), scheduleId ?? '');
+      await db.setSetting(
+        _metaKey('last_schedule_sync_at', userId),
+        DateTime.now().toUtc().toIso8601String(),
+      );
+      return shouldReplace;
+    } on FirebaseException catch (error) {
+      debugPrint(
+        '[SCHEDULE SYNC] Firestore unavailable (${error.code}); keeping SQLite schedule',
+      );
+      return false;
+    } catch (error) {
+      debugPrint(
+        '[SCHEDULE SYNC] Schedule refresh failed; keeping SQLite schedule: $error',
+      );
+      return false;
+    }
+  }
+
+  Map<String, dynamic>? _embeddedSchedule(Map<String, dynamic> groupData) {
+    final nested =
+        groupData['schedule'] ??
+        groupData['tracking_schedule'] ??
+        groupData['assigned_schedule'];
     if (nested is Map) return Map<String, dynamic>.from(nested);
-
-    if (userData.containsKey('start_time') || userData.containsKey('end_time') ||
-        userData.containsKey('start_hour') || userData.containsKey('end_hour')) {
-      return userData;
+    if (groupData.containsKey('start_time') ||
+        groupData.containsKey('start_hour')) {
+      return groupData;
     }
     return null;
   }
 
-  Future<Map<String, dynamic>?> _loadAssignedSchedule(String userId) async {
-    final userSnapshot = await _userRef(userId).get();
-    final userData = userSnapshot.data();
-    if (userData == null) return null;
+  bool _sameSchedule(TrackingSchedule a, TrackingSchedule b) =>
+      a.isEnabled == b.isEnabled &&
+      a.startHour == b.startHour &&
+      a.startMinute == b.startMinute &&
+      a.endHour == b.endHour &&
+      a.endMinute == b.endMinute &&
+      listEquals(a.selectedDays, b.selectedDays);
 
-    final direct = _scheduleMapFromUser(userData);
-    if (direct != null) return direct;
-
-    final groupId = (userData['group_id'] ?? userData['group'] ?? userData['user_group'])
-        ?.toString()
-        .trim();
-    if (groupId == null || groupId.isEmpty) return null;
-
-    final groupSnapshot = await _firestore.collection('groups').doc(groupId).get();
-    final groupData = groupSnapshot.data();
-    final scheduleId = groupData?['default_schedule_id']?.toString().trim();
-    if (scheduleId == null || scheduleId.isEmpty) return null;
-
-    final scheduleSnapshot = await _firestore.collection('schedules').doc(scheduleId).get();
-    return scheduleSnapshot.data();
-  }
-
-  Future<void> _emitAssignedSchedule(
-    String userId,
-    void Function(TrackingSchedule schedule) onChanged,
-  ) async {
-    try {
-      final data = await _loadAssignedSchedule(userId);
-      if (data == null) {
-        debugPrint('[ScheduleService] No assigned schedule found for $userId.');
-        return;
-      }
-      final schedule = TrackingSchedule.fromFirestore(data);
-      await DatabaseHelper.instance.saveTrackingSchedule(userId, schedule);
-      debugPrint('[ScheduleService] Loaded assigned schedule for $userId -> ${schedule.formattedTimeRange}');
-      onChanged(schedule);
-    } catch (e) {
-      debugPrint('[ScheduleService] Assigned schedule lookup failed: $e');
-    }
+  Future<TrackingSchedule> loadSchedule(String userId) async {
+    await syncAssignedSchedule(userId);
+    return loadCachedSchedule(userId);
   }
 
   Future<void> listenForScheduleUpdates(
     String userId, {
     required void Function(TrackingSchedule schedule) onChanged,
   }) async {
-    if (_activeUserId == userId && _listeners.isNotEmpty) {
-      debugPrint('[ScheduleService] Reusing existing Firestore listener for $userId');
-      return;
-    }
-
+    if (_activeUserId == userId && _listeners.isNotEmpty) return;
     stopListening();
     _activeUserId = userId;
-
-    _listeners.add(_userRef(userId).snapshots().listen((_) {
-      _emitAssignedSchedule(userId, onChanged);
-    }, onError: (Object error) {
-      debugPrint('[ScheduleService] Firestore user listener error: $error');
-    }));
-
-    _emitAssignedSchedule(userId, onChanged);
-
     try {
-      final userSnapshot = await _userRef(userId).get();
-      final userData = userSnapshot.data();
-      final groupId = (userData?['group_id'] ?? userData?['group'] ?? userData?['user_group'])
-          ?.toString()
-          .trim();
-      final groupSnapshot = groupId == null || groupId.isEmpty
-          ? null
-          : await _firestore.collection('groups').doc(groupId).get();
-      final scheduleId = groupSnapshot?.data()?['default_schedule_id']?.toString().trim();
-      if (scheduleId != null && scheduleId.isNotEmpty) {
-        _listeners.add(_firestore.collection('schedules').doc(scheduleId).snapshots().listen((snapshot) {
-          final data = snapshot.data();
-          if (data != null) {
-            final schedule = TrackingSchedule.fromFirestore(data);
-            DatabaseHelper.instance.saveTrackingSchedule(userId, schedule);
-            onChanged(schedule);
-          }
-        }, onError: (Object error) {
-          debugPrint('[ScheduleService] Firestore schedule listener error: $error');
-        }));
+      final userSnapshot = await _queryManagedUser(
+        userId,
+        source: Source.serverAndCache,
+      );
+      final userData = userSnapshot?.docs.first.data();
+      final groupValue =
+          userData?['group_id'] ??
+          userData?['groupId'] ??
+          userData?['group'] ??
+          userData?['user_group'] ??
+          userData?['group_name'];
+      final groupId = groupValue is Map
+          ? (groupValue['id'] ?? groupValue['group_id'] ?? groupValue['name'])
+                ?.toString()
+                .trim()
+          : groupValue?.toString().trim();
+
+      Future<void> refresh() async {
+        final changed = await syncAssignedSchedule(userId);
+        if (changed) onChanged(await loadCachedSchedule(userId));
       }
-    } catch (e) {
-      debugPrint('[ScheduleService] Could not attach assigned schedule listener: $e');
+
+      _listeners.add(
+        _firestore
+            .collection('users')
+            .where(
+              'username',
+              isEqualTo: (await DatabaseHelper.instance.getSetting(
+                'current_username',
+              ))?.toLowerCase(),
+            )
+            .limit(1)
+            .snapshots()
+            .listen((_) => refresh()),
+      );
+      if (groupId != null && groupId.isNotEmpty) {
+        final groupRef = _firestore.collection('groups').doc(groupId);
+        _listeners.add(groupRef.snapshots().listen((_) => refresh()));
+        final group = await groupRef.get(
+          const GetOptions(source: Source.serverAndCache),
+        );
+        final scheduleId = group.data()?['default_schedule_id']?.toString();
+        if (scheduleId != null && scheduleId.isNotEmpty) {
+          _listeners.add(
+            _firestore
+                .collection('schedules')
+                .doc(scheduleId)
+                .snapshots()
+                .listen((_) => refresh()),
+          );
+        }
+      }
+    } catch (error) {
+      debugPrint(
+        '[SCHEDULE SYNC] Could not attach foreground listeners: $error',
+      );
     }
   }
 
@@ -131,63 +328,12 @@ class ScheduleService {
     _activeUserId = null;
   }
 
-  /// Load schedule from the admin-assigned user profile first, then the legacy
-  /// per-user settings document, and finally fall back to SQLite.
-  Future<TrackingSchedule> loadSchedule(String userId) async {
-    TrackingSchedule? remote;
-    try {
-      final userDoc = await _userRef(userId).get(const GetOptions(source: Source.serverAndCache));
-      final userData = userDoc.data();
-      if (userData != null) {
-        final scheduleMap = _scheduleMapFromUser(userData);
-        if (scheduleMap != null) {
-          remote = TrackingSchedule.fromFirestore(scheduleMap);
-        } else {
-          final assigned = await _loadAssignedSchedule(userId);
-          if (assigned != null) remote = TrackingSchedule.fromFirestore(assigned);
-        }
-      }
-
-      if (remote == null) {
-        final settingsDoc = await _scheduleRef(userId).get(const GetOptions(source: Source.serverAndCache));
-        if (settingsDoc.exists && settingsDoc.data() != null) {
-          remote = TrackingSchedule.fromFirestore(settingsDoc.data()!);
-        }
-      }
-
-      if (remote != null) {
-        await DatabaseHelper.instance.saveTrackingSchedule(userId, remote);
-        debugPrint('[ScheduleService] Loaded schedule from Firestore for $userId');
-        return remote;
-      }
-    } catch (e) {
-      debugPrint('[ScheduleService] Firestore load failed (using local): $e');
-    }
-
-    final local = await DatabaseHelper.instance.getTrackingSchedule(userId);
-    debugPrint('[ScheduleService] Loaded schedule from SQLite for $userId');
-    return local;
-  }
-
-  /// Save schedule: persists to SQLite immediately, then syncs to Firestore.
+  /// Kept for callers that save a local schedule; Admin remains the Firestore
+  /// authority, so this method does not write a user-level Firestore override.
   Future<void> saveSchedule(String userId, TrackingSchedule schedule) async {
-    final updated = schedule.copyWith(lastUpdated: DateTime.now().toUtc());
-
-    await DatabaseHelper.instance.saveTrackingSchedule(userId, updated);
-    debugPrint('[ScheduleService] Schedule saved locally for $userId');
-
-    try {
-      await _userRef(userId).set(
-        {'assigned_schedule': updated.toFirestore()},
-        SetOptions(merge: true),
-      );
-      await _scheduleRef(userId).set(
-        updated.toFirestore(),
-        SetOptions(merge: true),
-      );
-      debugPrint('[ScheduleService] Schedule synced to Firestore for $userId');
-    } catch (e) {
-      debugPrint('[ScheduleService] Firestore sync failed (saved locally only): $e');
-    }
+    await DatabaseHelper.instance.saveTrackingSchedule(
+      userId,
+      schedule.copyWith(lastUpdated: DateTime.now().toUtc()),
+    );
   }
 }

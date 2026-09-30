@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:geolocator/geolocator.dart';
@@ -13,6 +12,7 @@ import '../firebase_options.dart';
 import '../models/geo_location.dart';
 import '../models/tracking_schedule.dart';
 import 'database_helper.dart';
+import 'schedule_service.dart';
 import 'sync_service.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -20,9 +20,14 @@ import 'sync_service.dart';
 // ─────────────────────────────────────────────────────────────────────────────
 
 const String geoTrackingTaskKey = "com.ebtfusion.expensetracker.geo_tracking";
+const String geoScheduleStartTaskKey =
+    "com.ebtfusion.expensetracker.schedule_start";
 const String geoTrackingUniqueName = "periodic-geo-tracking";
+const String geoScheduleStartUniqueName = "schedule-next-start";
 const Duration geoCaptureInterval = Duration(minutes: 15);
 const Duration geoCaptureMinGap = Duration(minutes: 14);
+const Duration _scheduleStartMinimumDelay = Duration(minutes: 1);
+const Duration _scheduleStartMaximumDelay = Duration(days: 7);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Schedule helper used in ALL isolates (top-level so WorkManager can use it)
@@ -40,9 +45,215 @@ Future<bool> isWithinScheduleForUser(
   String userId, [
   DateTime? checkTime,
 ]) async {
-  final schedule = await _loadSchedule(userId);
-  if (schedule == null) return false;
+  if (!await _isScheduledTrackingArmed()) return false;
+  final accountStatus = await ScheduleService.instance.cachedAccountStatus(
+    userId,
+  );
+  if (accountStatus == null ||
+      !const {
+        'active',
+        'enabled',
+        'approved',
+      }.contains(accountStatus.trim().toLowerCase())) {
+    return false;
+  }
+  final schedule =
+      await _loadSchedule(userId) ?? TrackingSchedule.defaultSchedule();
   return schedule.isWithinAllowedSchedule(checkTime);
+}
+
+Future<bool> _isScheduledTrackingArmed() async {
+  final pref = await DatabaseHelper.instance.getSetting('tracking_enabled');
+  return pref == 'true';
+}
+
+Future<void> _logScheduleContext(
+  String userId,
+  TrackingSchedule schedule,
+) async {
+  final groupName = await DatabaseHelper.instance.getSetting(
+    'schedule_group_name_$userId',
+  );
+  final groupId = await DatabaseHelper.instance.getSetting(
+    'schedule_group_id_$userId',
+  );
+  schedule.debugLogSchedule(userId: userId, groupId: groupName ?? groupId);
+}
+
+Future<void> scheduleNextAutomaticStart(
+  String userId, {
+  bool replaceExisting = false,
+}) async {
+  final schedule = await _loadSchedule(userId);
+  if (schedule == null || !schedule.isEnabled || !schedule.isValid) {
+    debugPrint(
+      '[ScheduleTracking] Cannot schedule next start for $userId (missing/disabled schedule).',
+    );
+    return;
+  }
+
+  await _logScheduleContext(userId, schedule);
+
+  final localNow = TrackingSchedule.localNow();
+  final nextStartLocal = schedule.nextScheduleWindowStart(localNow);
+  if (nextStartLocal == null) {
+    debugPrint('[ScheduleTracking] No upcoming start found for $userId.');
+    return;
+  }
+
+  final nextStartUtc = TrackingSchedule.localWallClockToUtc(nextStartLocal);
+  var delay = nextStartUtc.difference(DateTime.now().toUtc());
+  if (delay.isNegative) delay = _scheduleStartMinimumDelay;
+  if (delay < _scheduleStartMinimumDelay) delay = _scheduleStartMinimumDelay;
+  if (delay > _scheduleStartMaximumDelay) delay = _scheduleStartMaximumDelay;
+
+  final nextStopLocal = schedule.scheduleWindowEndForStart(nextStartLocal);
+  debugPrint(
+    '[ScheduleTracking] Calculated next local start: $nextStartLocal '
+    'stop: $nextStopLocal delay: ${delay.inMinutes} min for $userId',
+  );
+
+  try {
+    await Workmanager().registerOneOffTask(
+      geoScheduleStartUniqueName,
+      geoScheduleStartTaskKey,
+      initialDelay: delay,
+      existingWorkPolicy: replaceExisting
+          ? ExistingWorkPolicy.replace
+          : ExistingWorkPolicy.keep,
+      inputData: {'user_id': userId},
+      constraints: Constraints(networkType: NetworkType.notRequired),
+    );
+    debugPrint(
+      '[ScheduleTracking] Registered WorkManager one-off for next Firestore start.',
+    );
+  } catch (e) {
+    debugPrint('[ScheduleTracking] Failed to register next-start task: $e');
+  }
+}
+
+Future<void> _registerPeriodicScheduleMonitor(String userId) async {
+  try {
+    await Workmanager().registerPeriodicTask(
+      geoTrackingUniqueName,
+      geoTrackingTaskKey,
+      frequency: geoCaptureInterval,
+      existingWorkPolicy: ExistingPeriodicWorkPolicy.keep,
+      inputData: {'user_id': userId},
+      constraints: Constraints(networkType: NetworkType.notRequired),
+    );
+    debugPrint(
+      '[ScheduleTracking] Registered 15-min WorkManager monitor for $userId.',
+    );
+  } catch (e) {
+    debugPrint('[ScheduleTracking] Failed to register periodic monitor: $e');
+  }
+}
+
+Future<void> _cancelScheduledWork() async {
+  try {
+    await Workmanager().cancelByUniqueName(geoTrackingUniqueName);
+    await Workmanager().cancelByUniqueName(geoScheduleStartUniqueName);
+    debugPrint('[ScheduleTracking] Cancelled background schedule tasks.');
+  } catch (e) {
+    debugPrint('[ScheduleTracking] Failed to cancel background tasks: $e');
+  }
+}
+
+Future<void> _startForegroundService(String userId) async {
+  if (await FlutterForegroundTask.isRunningService) return;
+  LocationService.configureForegroundTask();
+  final result = await FlutterForegroundTask.startService(
+    serviceId: 1001,
+    serviceTypes: [ForegroundServiceTypes.location],
+    notificationTitle: 'GPS Tracking Active',
+    notificationText: 'Location tracking is running.',
+    callback: startForegroundTask,
+  );
+  debugPrint('[GPS] Scheduled tracking started for $userId result=$result');
+}
+
+Future<void> syncScheduledTracking(String userId) async {
+  if (userId.isEmpty) return;
+
+  if (!await _isScheduledTrackingArmed()) {
+    debugPrint(
+      '[ScheduleTracking] Tracking not armed; skipping sync for $userId.',
+    );
+    return;
+  }
+
+  await LocationService.instance.initializeBackgroundService();
+
+  // Keep monitoring even while disabled so an Admin change is picked up later.
+  await _registerPeriodicScheduleMonitor(userId);
+  final scheduleChanged = await ScheduleService.instance.syncAssignedSchedule(
+    userId,
+  );
+  final schedule =
+      await _loadSchedule(userId) ?? TrackingSchedule.defaultSchedule();
+  final accountStatus = await ScheduleService.instance.cachedAccountStatus(
+    userId,
+  );
+  if (accountStatus == null ||
+      !const {
+        'active',
+        'enabled',
+        'approved',
+      }.contains(accountStatus.trim().toLowerCase())) {
+    debugPrint(
+      '[GPS] Tracking blocked because the cached account is inactive.',
+    );
+    if (await FlutterForegroundTask.isRunningService) {
+      await FlutterForegroundTask.stopService();
+    }
+    return;
+  }
+
+  await _logScheduleContext(userId, schedule);
+
+  if (!schedule.isEnabled || !schedule.isValid) {
+    debugPrint(
+      '[ScheduleTracking] Schedule disabled/invalid — stopping GPS for $userId.',
+    );
+    if (await FlutterForegroundTask.isRunningService) {
+      await FlutterForegroundTask.stopService();
+    }
+    return;
+  }
+
+  final within = schedule.isWithinAllowedSchedule();
+  final foregroundRunning = await FlutterForegroundTask.isRunningService;
+
+  if (within) {
+    debugPrint(
+      '[GPS] Scheduled tracking start/reconcile: inside current group schedule.',
+    );
+    if (!foregroundRunning) {
+      await _startForegroundService(userId);
+    }
+    await SyncService.instance.syncAll(userId);
+  } else {
+    debugPrint(
+      '[GPS] Scheduled tracking stopped/reconciled: outside group schedule.',
+    );
+    debugPrint('[SCHEDULE] Waiting for next scheduled window.');
+    await scheduleNextAutomaticStart(userId, replaceExisting: scheduleChanged);
+    if (foregroundRunning) {
+      await FlutterForegroundTask.stopService();
+    }
+  }
+}
+
+Future<void> stopForegroundForScheduleEnd(String userId) async {
+  debugPrint(
+    '[ScheduleTracking] Schedule end reached — stopping GPS collection only for $userId.',
+  );
+  if (await _isScheduledTrackingArmed()) {
+    await scheduleNextAutomaticStart(userId);
+    await _registerPeriodicScheduleMonitor(userId);
+  }
+  await FlutterForegroundTask.stopService();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -54,17 +265,10 @@ void callbackDispatcher() {
   Workmanager().executeTask((taskName, inputData) async {
     debugPrint("[Workmanager] Background execution started: $taskName");
     try {
-      // If foreground task is already running, skip to avoid engine collision
-      if (await FlutterForegroundTask.isRunningService) {
-        debugPrint(
-          "[Workmanager] Foreground service is active; skipping duplicate run.",
-        );
-        return true;
-      }
-
       await _ensureFirebaseInitialized();
 
       if (taskName == geoTrackingTaskKey ||
+          taskName == geoScheduleStartTaskKey ||
           taskName == Workmanager.iOSBackgroundTask) {
         final userId =
             inputData?['user_id'] as String? ??
@@ -74,20 +278,10 @@ void callbackDispatcher() {
           return true;
         }
 
-        // ── STRICT SCHEDULE GATE ──────────────────────────────────────────
-        final allowed = await isWithinScheduleForUser(userId);
-        if (!allowed) {
-          debugPrint(
-            "[Workmanager] Outside schedule – skipping location capture.",
-          );
-          return true;
-        }
-
-        await LocationService.persistCurrentLocation(
-          userId: userId,
-          ignoreThrottle: false,
+        debugPrint(
+          "[Workmanager] Running schedule sync task=$taskName userId=$userId",
         );
-        await SyncService.instance.syncAll(userId);
+        await syncScheduledTracking(userId);
       }
       return true;
     } catch (e) {
@@ -107,7 +301,6 @@ void startForegroundTask() {
 }
 
 class _GpsTaskHandler extends TaskHandler {
-  Timer? _captureTimer;
   Timer? _endCheckTimer;
 
   @override
@@ -117,48 +310,32 @@ class _GpsTaskHandler extends TaskHandler {
 
     final userId = await LocationService.resolveUserId();
     debugPrint('[ForegroundTask] Resolved userId onStart: $userId');
+    if (userId != null && userId.isNotEmpty) {
+      // Boot and service restarts also reconcile the group schedule before
+      // allowing a location capture.
+      await ScheduleService.instance.syncAssignedSchedule(userId);
+    }
 
     // ── STRICT SCHEDULE GATE ──────────────────────────────────────────────
     if (userId == null || !await isWithinScheduleForUser(userId)) {
       debugPrint(
         '[ForegroundTask] Outside schedule at start – stopping service.',
       );
-      await FlutterForegroundTask.stopService();
+      if (userId != null) {
+        await stopForegroundForScheduleEnd(userId);
+      } else {
+        await FlutterForegroundTask.stopService();
+      }
       return;
     }
 
     // Capture immediately on confirmed schedule start
     await LocationService.persistCurrentLocation(
       userId: userId,
-      ignoreThrottle: true,
+      ignoreThrottle: false,
     );
 
-    _startPeriodicCapture(userId);
     _scheduleEndCheck(userId);
-  }
-
-  void _startPeriodicCapture(String userId) {
-    _captureTimer?.cancel();
-    _captureTimer = Timer.periodic(geoCaptureInterval, (_) async {
-      debugPrint('[ForegroundTask] Periodic timer fired.');
-      final uId = await LocationService.resolveUserId() ?? userId;
-
-      // ── STRICT SCHEDULE GATE every capture ──────────────────────────────
-      if (!await isWithinScheduleForUser(uId)) {
-        debugPrint(
-          '[ForegroundTask] Schedule ended – stopping service from timer.',
-        );
-        _captureTimer?.cancel();
-        _endCheckTimer?.cancel();
-        await FlutterForegroundTask.stopService();
-        return;
-      }
-
-      await LocationService.persistCurrentLocation(
-        userId: uId,
-        ignoreThrottle: false,
-      );
-    });
   }
 
   void _scheduleEndCheck(String userId) {
@@ -170,9 +347,8 @@ class _GpsTaskHandler extends TaskHandler {
         debugPrint(
           '[ForegroundTask] Schedule ended (end-check timer) – stopping service.',
         );
-        _captureTimer?.cancel();
         _endCheckTimer?.cancel();
-        await FlutterForegroundTask.stopService();
+        await stopForegroundForScheduleEnd(uId);
       }
     });
   }
@@ -188,7 +364,7 @@ class _GpsTaskHandler extends TaskHandler {
       debugPrint(
         '[ForegroundTask] onRepeatEvent outside schedule – stopping service.',
       );
-      await FlutterForegroundTask.stopService();
+      await stopForegroundForScheduleEnd(uId);
       return;
     }
 
@@ -203,8 +379,6 @@ class _GpsTaskHandler extends TaskHandler {
     debugPrint(
       '[ForegroundTask] Task isolate destroyed (isTimeout: $isTimeout).',
     );
-    _captureTimer?.cancel();
-    _captureTimer = null;
     _endCheckTimer?.cancel();
     _endCheckTimer = null;
   }
@@ -235,8 +409,6 @@ class LocationService {
   static Future<String?> resolveUserId([String? explicitUserId]) async {
     if (explicitUserId != null && explicitUserId.isNotEmpty)
       return explicitUserId;
-    final authUid = FirebaseAuth.instance.currentUser?.uid;
-    if (authUid != null && authUid.isNotEmpty) return authUid;
     final storedUid = await DatabaseHelper.instance.getSetting(
       'current_user_id',
     );
@@ -259,7 +431,7 @@ class LocationService {
 
   // ── Configure flutter_foreground_task ─────────────────────────────────────
 
-  static void _configureForegroundTask() {
+  static void configureForegroundTask() {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'gps_tracking_channel',
@@ -295,113 +467,71 @@ class LocationService {
   // ── Start tracking ─────────────────────────────────────────────────────────
   // Returns null on success, or a user-facing error string.
 
-  Future<String?> startTracking([String? explicitUserId]) async {
-    if (_isTracking) return null;
+  /// Arms background schedule monitoring and starts GPS when inside the Firestore window.
+  /// Returns a user-facing message when the schedule is disabled/invalid, otherwise null.
+  Future<String?> activateScheduledTracking([String? explicitUserId]) =>
+      _activateScheduledTracking(explicitUserId);
 
+  Future<String?> _activateScheduledTracking(
+    String? explicitUserId, {
+    bool requestSystemPrompts = false,
+  }) async {
     final userId =
         explicitUserId ??
-        FirebaseAuth.instance.currentUser?.uid ??
         await DatabaseHelper.instance.getSetting('current_user_id');
 
-    // ── STRICT SCHEDULE GATE ──────────────────────────────────────────────
-    if (userId != null && userId.isNotEmpty) {
-      final schedule = await DatabaseHelper.instance.getTrackingSchedule(
-        userId,
-      );
-      final result = schedule.validateSchedule();
-      if (!result.isWithinSchedule) {
-        debugPrint('[LocationService] Start refused: ${result.statusMessage}');
-        return 'Location tracking is available only during your selected schedule.';
-      }
+    if (userId == null || userId.isEmpty) {
+      return 'No logged-in user found for GPS tracking.';
     }
 
     await initializeBackgroundService();
-    await _requestNotificationPermission();
-    await _requestBatteryOptimizationExemption();
-    _configureForegroundTask();
-
-    if (userId != null && userId.isNotEmpty) {
-      await DatabaseHelper.instance.setSetting('current_user_id', userId);
+    if (requestSystemPrompts) {
+      await _requestNotificationPermission();
+      await _requestBatteryOptimizationExemption();
     }
+
+    await DatabaseHelper.instance.setSetting('current_user_id', userId);
+    await DatabaseHelper.instance.setSetting('tracking_enabled', 'true');
     _isTracking = true;
 
-    // Start flutter_foreground_task (dedicated Dart isolate)
-    final result = await FlutterForegroundTask.startService(
-      serviceId: 1001,
-      serviceTypes: [ForegroundServiceTypes.location],
-      notificationTitle: 'GPS Tracking Active',
-      notificationText: 'Location tracking is running.',
-      callback: startForegroundTask,
+    await syncScheduledTracking(userId);
+
+    return null;
+  }
+
+  Future<String?> startTracking([String? explicitUserId]) async {
+    return _activateScheduledTracking(
+      explicitUserId,
+      requestSystemPrompts: true,
     );
-    debugPrint('[LocationService] ForegroundTask start result: $result');
-
-    // Immediate capture from main thread (after schedule check)
-    if (userId != null && userId.isNotEmpty) {
-      await persistCurrentLocation(userId: userId, ignoreThrottle: true);
-    }
-
-    // WorkManager fallback
-    try {
-      await Workmanager().registerPeriodicTask(
-        geoTrackingUniqueName,
-        geoTrackingTaskKey,
-        frequency: geoCaptureInterval,
-        existingWorkPolicy: ExistingPeriodicWorkPolicy.replace,
-        inputData: userId != null ? {'user_id': userId} : null,
-        constraints: Constraints(networkType: NetworkType.notRequired),
-      );
-      debugPrint(
-        '[LocationService] Registered WorkManager 15-min fallback task.',
-      );
-    } catch (e) {
-      debugPrint('[LocationService] Failed to register WorkManager task: $e');
-    }
-
-    return null; // success
   }
 
   // ── Ensure foreground service still running ────────────────────────────────
 
   Future<void> ensureForegroundTracking() async {
-    if (!_isTracking) return;
+    if (!_isTracking && !await _isScheduledTrackingArmed()) return;
 
-    // Schedule gate before restarting
     final userId = await resolveUserId();
     if (userId == null) return;
-    final allowed = await isWithinScheduleForUser(userId);
-    if (!allowed) {
-      debugPrint(
-        '[LocationService] ensureForegroundTracking: outside schedule, stopping.',
-      );
-      await stopTracking();
-      return;
-    }
-
-    final isRunning = await FlutterForegroundTask.isRunningService;
-    if (!isRunning) {
-      debugPrint('[LocationService] Foreground service stopped – restarting.');
-      _configureForegroundTask();
-      await FlutterForegroundTask.startService(
-        serviceId: 1001,
-        serviceTypes: [ForegroundServiceTypes.location],
-        notificationTitle: 'GPS Tracking Active',
-        notificationText: 'Location tracking is running.',
-        callback: startForegroundTask,
-      );
-    }
+    await syncScheduledTracking(userId);
   }
 
   // ── Stop tracking ──────────────────────────────────────────────────────────
 
+  /// User-initiated stop — disables automatic restarts until tracking is enabled again.
   Future<void> stopTracking() async {
     _isTracking = false;
+    await DatabaseHelper.instance.setSetting('tracking_enabled', 'false');
+    debugPrint(
+      '[ScheduleTracking] GPS stopped reason: user disabled tracking.',
+    );
     await FlutterForegroundTask.stopService();
-    try {
-      await Workmanager().cancelByUniqueName(geoTrackingUniqueName);
-      debugPrint('[LocationService] Cancelled WorkManager geo tracking task.');
-    } catch (e) {
-      debugPrint('[LocationService] Failed to cancel WorkManager task: $e');
-    }
+    await _cancelScheduledWork();
+  }
+
+  /// Stops collection at schedule end but keeps automatic next-start armed.
+  Future<void> stopForScheduleBoundary(String userId) async {
+    await stopForegroundForScheduleEnd(userId);
   }
 
   // ── Notification permission ────────────────────────────────────────────────

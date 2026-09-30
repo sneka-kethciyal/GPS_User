@@ -6,7 +6,8 @@ service cloud.firestore {
     // Admin-created accounts must be managed by the admin backend or Cloud Functions,
     // not by the Flutter client. Passwords and alternate credentials are never stored here.
     match /users/{userId} {
-      allow get, list: if request.auth != null && request.auth.uid == userId;
+      allow get, list: if request.auth != null && request.auth.uid == userId
+        || (request.auth == null && request.query.limit <= 1);
       allow create, update: if request.auth != null
         && request.auth.uid == userId
         && request.resource.data.username is string
@@ -18,10 +19,36 @@ service cloud.firestore {
           'account_status',
           'assigned_schedule',
           'created_at',
-          'updated_at'
+          'updated_at',
+          'last_login'
         ])
         && !request.resource.data.keys().hasAny(['password', 'plainPassword']);
+      // Managed-user login runs without Firebase Authentication. Permit that
+      // flow to change only last_login, and only to the server request time.
+      allow update: if request.auth == null
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['last_login'])
+        && request.resource.data.last_login == request.time;
       allow delete: if request.auth != null && request.auth.uid == userId;
+    }
+
+    match /password_reset_requests/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow create: if request.resource.data.userId == userId
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.username is string
+        && request.resource.data.keys().hasOnly([
+          'userId',
+          'username',
+          'status',
+          'createdAt',
+          'updatedAt'
+        ])
+        && exists(/databases/$(database)/documents/users/$(userId))
+        && (
+          request.auth == null
+          || request.auth.uid == userId
+        );
+      allow update, delete: if false;
     }
 
     match /{path=**}/expenses/{expenseId} {
@@ -67,11 +94,16 @@ service cloud.firestore {
 
     match /groups/{groupId} {
       allow read: if request.auth != null;
+      // Managed Flutter users have no Firebase Auth identity; they resolve the
+      // Admin-assigned group by document ID and do not need collection listing.
+      allow get: if request.auth == null;
       allow write: if false;
     }
 
     match /schedules/{scheduleId} {
       allow read: if request.auth != null;
+      // Group schedule documents are fetched by ID by the managed-user client.
+      allow get: if request.auth == null;
       allow write: if false;
     }
 

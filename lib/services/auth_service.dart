@@ -1,8 +1,29 @@
+import 'dart:convert';
+import 'dart:math';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cryptography/cryptography.dart';
 import 'package:flutter/foundation.dart';
 
 import '../models/tracking_schedule.dart';
+import 'database_helper.dart';
+
+class ManagedAuthException implements Exception {
+  const ManagedAuthException(this.code, this.message);
+
+  final String code;
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+class ManagedUserSession {
+  const ManagedUserSession({required this.userId, required this.username});
+
+  final String userId;
+  final String username;
+}
 
 class AppUserProfile {
   final String username;
@@ -20,206 +41,422 @@ class AppUserProfile {
   });
 }
 
+enum PasswordResetRequestOutcome { created, alreadyPending }
+
+class PasswordResetRequestStatus {
+  final String status;
+  final DateTime? updatedAt;
+
+  const PasswordResetRequestStatus({required this.status, this.updatedAt});
+
+  bool get isPending => status.toUpperCase() == 'PENDING';
+  bool get isCompleted => status.toUpperCase() == 'COMPLETED';
+  bool get isRejected => status.toUpperCase() == 'REJECTED';
+}
+
 class AuthService {
-  AuthService({
-    FirebaseAuth? auth,
-    FirebaseFirestore? firestore,
-    this.lastLoginWriter,
-  }) : _auth = auth ?? FirebaseAuth.instance,
-       _firestore = firestore ?? FirebaseFirestore.instance;
+  AuthService({FirebaseFirestore? firestore})
+    : _firestore = firestore ?? FirebaseFirestore.instance;
 
-  final FirebaseAuth _auth;
+  static const int _pbkdf2Iterations = 310000;
+  static const String _pbkdf2Algorithm = 'PBKDF2-SHA256-310000';
+  static final ValueNotifier<String?> managedUserId = ValueNotifier(null);
+
   final FirebaseFirestore _firestore;
-  final Future<void> Function(String uid)? lastLoginWriter;
+  static const _sessionUserIdKey = 'current_user_id';
+  static const _sessionUsernameKey = 'current_username';
 
-  Stream<User?> get authStateChanges => _auth.authStateChanges();
-
-  Future<UserCredential> login({
+  Future<ManagedUserSession> login({
     required String username,
     required String password,
   }) async {
-    final email = await resolveLoginEmail(username);
-    final credential = await _auth.signInWithEmailAndPassword(
-      email: email,
-      password: password,
-    );
-    final user = credential.user;
-    if (user != null) {
-      try {
-        await (lastLoginWriter ?? _writeLastLogin)(user.uid);
-      } catch (error) {
-        // A profile timestamp failure must not log the authenticated user out.
-        debugPrint('[AuthService] Could not update last_login: $error');
-      }
+    final trimmedUsername = username.trim().toLowerCase();
+    if (trimmedUsername.isEmpty || password.isEmpty) {
+      throw const ManagedAuthException(
+        'invalid-credential',
+        'Invalid username or password.',
+      );
     }
-    return credential;
+
+    try {
+      final users = await _firestore
+          .collection('users')
+          .where('username', isEqualTo: trimmedUsername)
+          .limit(1)
+          .get();
+      if (users.docs.isEmpty) {
+        debugPrint('[ManagedLogin] username lookup failed');
+        throw const ManagedAuthException(
+          'invalid-credential',
+          'Invalid username or password.',
+        );
+      }
+
+      final userDocument = users.docs.first;
+      final userData = userDocument.data();
+      debugPrint('[ManagedLogin] username lookup succeeded');
+      debugPrint('[ManagedLogin] userId=${userDocument.id}');
+
+      final passwordHash = userData['password_hash']?.toString() ?? '';
+      final saltHex = userData['salt']?.toString() ?? '';
+      final algorithm = userData['hash_algorithm']?.toString() ?? '';
+      final salt = _decodeHex(saltHex);
+      debugPrint(
+        '[ManagedLogin] algorithm=$algorithm salt_length=${salt.length}',
+      );
+
+      if (algorithm != _pbkdf2Algorithm || salt.length != 16) {
+        debugPrint('[ManagedLogin] password hash comparison=false');
+        throw const ManagedAuthException(
+          'invalid-credential',
+          'Invalid username or password.',
+        );
+      }
+
+      final generatedHash = await derivePasswordHash(password, salt);
+      debugPrint(
+        '[ManagedLogin] generated_hash_length=${generatedHash.length}',
+      );
+      final matches = _constantTimeEqualsHex(generatedHash, passwordHash);
+      debugPrint('[ManagedLogin] password hash comparison=$matches');
+      if (!matches) {
+        throw const ManagedAuthException(
+          'invalid-credential',
+          'Invalid username or password.',
+        );
+      }
+
+      if (!isAccountActive(userData)) {
+        throw const ManagedAuthException(
+          'user-disabled',
+          'This account is inactive. Please contact your admin.',
+        );
+      }
+
+      await userDocument.reference.update(lastLoginUpdate());
+
+      final session = ManagedUserSession(
+        userId: userDocument.id,
+        username: userData['username']?.toString() ?? trimmedUsername,
+      );
+      await _saveSession(session);
+      managedUserId.value = session.userId;
+      return session;
+    } on ManagedAuthException {
+      rethrow;
+    } on FirebaseException catch (error) {
+      debugPrint('[ManagedLogin] Firestore login failed: ${error.code}');
+      throw const ManagedAuthException(
+        'network-request-failed',
+        'Could not sign in. Check your connection and try again.',
+      );
+    }
+  }
+
+  static Future<String> derivePasswordHash(
+    String password,
+    List<int> salt,
+  ) async {
+    final key = await Pbkdf2(
+      macAlgorithm: Hmac.sha256(),
+      iterations: _pbkdf2Iterations,
+      bits: 256,
+    ).deriveKey(secretKey: SecretKey(utf8.encode(password)), nonce: salt);
+    return _encodeHex(await key.extractBytes());
+  }
+
+  static List<int> _decodeHex(String value) {
+    if (value.isEmpty ||
+        value.length.isOdd ||
+        !RegExp(r'^[0-9a-fA-F]+$').hasMatch(value)) {
+      return const [];
+    }
+    return [
+      for (var index = 0; index < value.length; index += 2)
+        int.parse(value.substring(index, index + 2), radix: 16),
+    ];
+  }
+
+  static String _encodeHex(List<int> bytes) =>
+      bytes.map((byte) => byte.toRadixString(16).padLeft(2, '0')).join();
+
+  static bool _constantTimeEqualsHex(String actual, String expected) {
+    final actualBytes = _decodeHex(actual);
+    final expectedBytes = _decodeHex(expected);
+    if (actualBytes.isEmpty || actualBytes.length != expectedBytes.length) {
+      return false;
+    }
+    var difference = 0;
+    for (var index = 0; index < actualBytes.length; index++) {
+      difference |= actualBytes[index] ^ expectedBytes[index];
+    }
+    return difference == 0;
   }
 
   static Map<String, dynamic> lastLoginUpdate() {
     return {'last_login': FieldValue.serverTimestamp()};
   }
 
-  static Map<String, dynamic> passwordResetRequestUpdate() {
+  Future<void> _saveSession(ManagedUserSession session) async {
+    await DatabaseHelper.instance.setSetting(_sessionUserIdKey, session.userId);
+    await DatabaseHelper.instance.setSetting(
+      _sessionUsernameKey,
+      session.username,
+    );
+  }
+
+  Future<bool> isManagedUserLoggedIn() async {
+    final userId = await DatabaseHelper.instance.getSetting(_sessionUserIdKey);
+    return userId != null && userId.isNotEmpty;
+  }
+
+  Future<ManagedUserSession?> getCurrentManagedUser() async {
+    final userId = await DatabaseHelper.instance.getSetting(_sessionUserIdKey);
+    final username = await DatabaseHelper.instance.getSetting(
+      _sessionUsernameKey,
+    );
+    if (userId == null ||
+        userId.isEmpty ||
+        username == null ||
+        username.isEmpty) {
+      return null;
+    }
+    return ManagedUserSession(userId: userId, username: username);
+  }
+
+  Future<ManagedUserSession?> restoreManagedUserSession() async {
+    final session = await getCurrentManagedUser();
+    if (session == null) {
+      managedUserId.value = null;
+      return null;
+    }
+    try {
+      final users = await _firestore
+          .collection('users')
+          .where('username', isEqualTo: session.username.toLowerCase())
+          .limit(1)
+          .get();
+      if (users.docs.isEmpty ||
+          users.docs.first.id != session.userId ||
+          !isAccountActive(users.docs.first.data())) {
+        await logout();
+        return null;
+      }
+      managedUserId.value = session.userId;
+      return session;
+    } on FirebaseException {
+      await logout();
+      return null;
+    }
+  }
+
+  Future<void> logout() async {
+    await DatabaseHelper.instance.setSetting(_sessionUserIdKey, '');
+    await DatabaseHelper.instance.setSetting(_sessionUsernameKey, '');
+    managedUserId.value = null;
+  }
+
+  static Map<String, dynamic> passwordResetRequestDocument({
+    required String userId,
+    required String username,
+  }) {
     return {
-      'password_reset_requested': true,
-      'password_reset_status': 'requested',
-      'password_reset_requested_at': FieldValue.serverTimestamp(),
+      'userId': userId,
+      'username': username.trim().toLowerCase(),
+      'status': 'PENDING',
+      'createdAt': FieldValue.serverTimestamp(),
+      'updatedAt': FieldValue.serverTimestamp(),
     };
   }
 
-  Future<void> _writeLastLogin(String uid) {
-    return _firestore
-        .collection('users')
-        .doc(uid)
-        .set(lastLoginUpdate(), SetOptions(merge: true));
+  Future<PasswordResetRequestOutcome> requestPasswordReset(
+    String username,
+  ) async {
+    final trimmedUsername = username.trim();
+    if (trimmedUsername.isEmpty) {
+      throw const ManagedAuthException('invalid-username', 'Enter a username.');
+    }
+
+    final user = await getUserByUsername(trimmedUsername);
+    if (user == null) {
+      throw const ManagedAuthException(
+        'invalid-credential',
+        'Invalid username or password.',
+      );
+    }
+
+    final resolvedUserId = user['id'] as String;
+    final profileUsername = (user['username'] ?? trimmedUsername).toString();
+    final requestReference = _firestore
+        .collection('password_reset_requests')
+        .doc(resolvedUserId);
+    await requestReference.set(
+      passwordResetRequestDocument(
+        userId: resolvedUserId,
+        username: profileUsername,
+      ),
+    );
+    return PasswordResetRequestOutcome.created;
   }
 
-  Future<bool> requestPasswordReset(String username) async {
-    final currentUser = _auth.currentUser;
-    DocumentReference<Map<String, dynamic>>? userReference;
+  Future<PasswordResetRequestStatus?> loadPasswordResetRequestStatus([
+    String? uid,
+  ]) async {
+    final userId = uid ?? managedUserId.value ?? await getManagedUserId();
+    if (userId == null || userId.isEmpty) return null;
 
-    if (currentUser != null) {
-      userReference = _firestore.collection('users').doc(currentUser.uid);
-    } else {
-      final trimmedUsername = username.trim();
-      final query = await _firestore
-          .collection('users')
-          .where('username', isEqualTo: trimmedUsername)
-          .limit(1)
+    try {
+      final doc = await _firestore
+          .collection('password_reset_requests')
+          .doc(userId)
           .get();
-      if (query.docs.isNotEmpty) {
-        userReference = query.docs.first.reference;
+      if (!doc.exists || doc.data() == null) return null;
+
+      final data = doc.data()!;
+      final status = data['status']?.toString() ?? '';
+      if (status.isEmpty) return null;
+
+      final updatedAtRaw = data['updatedAt'];
+      DateTime? updatedAt;
+      if (updatedAtRaw is Timestamp) {
+        updatedAt = updatedAtRaw.toDate();
       }
+
+      return PasswordResetRequestStatus(status: status, updatedAt: updatedAt);
+    } on FirebaseException catch (error) {
+      debugPrint('[ManagedLogin] reset status unavailable: ${error.code}');
+      return null;
     }
-
-    if (userReference == null) {
-      throw FirebaseAuthException(
-        code: 'user-not-found',
-        message: 'No account was found for that username.',
-      );
-    }
-    final reference = userReference;
-
-    return _firestore.runTransaction((transaction) async {
-      final snapshot = await transaction.get(reference);
-      final data = snapshot.data() ?? const <String, dynamic>{};
-      final status = data['password_reset_status']?.toString().toLowerCase();
-      final isPending =
-          data['password_reset_requested'] == true && status == 'requested';
-      if (isPending) return true;
-
-      transaction.set(
-        reference,
-        passwordResetRequestUpdate(),
-        SetOptions(merge: true),
-      );
-      return false;
-    });
   }
 
-  Future<void> logout() => _auth.signOut();
-
-  Future<User?> reloadCurrentUser() async {
-    final currentUser = _auth.currentUser;
-    if (currentUser == null) return null;
-    await currentUser.reload();
-    return _auth.currentUser;
+  Future<String?> getManagedUserId() async {
+    final userId = await DatabaseHelper.instance.getSetting(_sessionUserIdKey);
+    return userId == null || userId.isEmpty ? null : userId;
   }
 
   Future<AppUserProfile?> loadCurrentUserProfile([String? uid]) async {
-    final userId = uid ?? _auth.currentUser?.uid;
-    if (userId == null || userId.isEmpty) return null;
+    final session = await getCurrentManagedUser();
+    final userId = uid ?? session?.userId;
+    final username = session?.username;
+    if (userId == null || userId.isEmpty || username == null) return null;
 
-    final doc = await FirebaseFirestore.instance
+    final users = await _firestore
         .collection('users')
-        .doc(userId)
+        .where('username', isEqualTo: username.toLowerCase())
+        .limit(1)
         .get();
-    if (!doc.exists || doc.data() == null) return null;
-    return profileFromMap(doc.data()!);
+    if (users.docs.isEmpty || users.docs.first.id != userId) return null;
+    return profileFromMap(users.docs.first.data());
   }
 
   Future<bool> isCurrentUserActive() async {
-    final profile = await loadCurrentUserProfile();
-    if (profile == null) return false;
-    return isAccountActive({
-      'account_status': profile.accountStatus ?? 'active',
-    });
+    final session = await getCurrentManagedUser();
+    if (session == null) return false;
+    final users = await _firestore
+        .collection('users')
+        .where('username', isEqualTo: session.username.toLowerCase())
+        .limit(1)
+        .get();
+    return users.docs.isNotEmpty &&
+        users.docs.first.id == session.userId &&
+        isAccountActive(users.docs.first.data());
   }
 
-  Future<void> changePassword({
+  Future<void> changeManagedPassword({
     required String currentPassword,
     required String newPassword,
     required String confirmPassword,
   }) async {
-    final user = _auth.currentUser;
-    if (user == null) {
-      throw FirebaseAuthException(
-        code: 'user-not-found',
-        message: 'No logged-in user found.',
+    final session = await getCurrentManagedUser();
+    if (session == null) {
+      throw const ManagedAuthException(
+        'not-logged-in',
+        'No logged-in user found.',
       );
     }
 
     final trimmedNewPassword = newPassword.trim();
     if (trimmedNewPassword.isEmpty) {
-      throw FirebaseAuthException(
-        code: 'invalid-password',
-        message: 'Enter a new password.',
+      throw const ManagedAuthException(
+        'invalid-password',
+        'Enter a new password.',
       );
     }
     if (trimmedNewPassword.length < 6) {
-      throw FirebaseAuthException(
-        code: 'weak-password',
-        message: 'Password must be at least 6 characters long.',
+      throw const ManagedAuthException(
+        'weak-password',
+        'Password must be at least 6 characters long.',
       );
     }
     if (trimmedNewPassword != confirmPassword.trim()) {
-      throw FirebaseAuthException(
-        code: 'invalid-password',
-        message: 'New password and confirmation do not match.',
+      throw const ManagedAuthException(
+        'invalid-password',
+        'New password and confirmation do not match.',
       );
     }
-
-    final email = user.email;
-    if (email == null || email.isEmpty) {
-      throw FirebaseAuthException(
-        code: 'invalid-email',
-        message: 'User email is unavailable for password reset.',
-      );
-    }
-
-    final credential = EmailAuthProvider.credential(
-      email: email,
-      password: currentPassword,
-    );
-
-    await user.reauthenticateWithCredential(credential);
-    await user.updatePassword(trimmedNewPassword);
-  }
-
-  Future<String> resolveLoginEmail(String username) async {
-    final trimmedUsername = username.trim();
-    if (trimmedUsername.isEmpty) return usernameToEmail(trimmedUsername);
 
     try {
-      final query = await FirebaseFirestore.instance
+      final users = await _firestore
           .collection('users')
-          .where('username', isEqualTo: trimmedUsername)
+          .where('username', isEqualTo: session.username.toLowerCase())
           .limit(1)
           .get();
-
-      if (query.docs.isNotEmpty) {
-        final email = query.docs.first.data()['email']?.toString();
-        if (email != null && email.trim().isNotEmpty) return email.trim();
+      if (users.docs.isEmpty || users.docs.first.id != session.userId) {
+        throw const ManagedAuthException(
+          'invalid-credential',
+          'Current password could not be verified.',
+        );
       }
-    } catch (_) {
-      // Fall back to the legacy username-to-email mapping below.
-    }
 
-    return usernameToEmail(trimmedUsername);
+      final userData = users.docs.first.data();
+      final currentSalt = _decodeHex(userData['salt']?.toString() ?? '');
+      final currentHash = userData['password_hash']?.toString() ?? '';
+      final currentMatches =
+          userData['hash_algorithm'] == _pbkdf2Algorithm &&
+          currentSalt.length == 16 &&
+          _constantTimeEqualsHex(
+            await derivePasswordHash(currentPassword, currentSalt),
+            currentHash,
+          );
+      if (!currentMatches) {
+        throw const ManagedAuthException(
+          'invalid-credential',
+          'Current password is incorrect.',
+        );
+      }
+
+      final random = Random.secure();
+      final newSalt = List<int>.generate(16, (_) => random.nextInt(256));
+      final newHash = await derivePasswordHash(trimmedNewPassword, newSalt);
+      await _firestore.collection('users').doc(session.userId).update({
+        'password_hash': newHash,
+        'salt': _encodeHex(newSalt),
+        'hash_algorithm': _pbkdf2Algorithm,
+        'passwordChangedAt': FieldValue.serverTimestamp(),
+        'password_changed_at': FieldValue.serverTimestamp(),
+        'updated_at': FieldValue.serverTimestamp(),
+      });
+    } on ManagedAuthException {
+      rethrow;
+    } on FirebaseException catch (error) {
+      debugPrint('[ManagedLogin] password update failed: ${error.code}');
+      throw const ManagedAuthException(
+        'permission-denied',
+        'Password could not be changed. Firestore permissions may not allow this update.',
+      );
+    }
   }
 
-  static String usernameToEmail(String username) {
-    return '${username.trim().toLowerCase()}@ebtfusion.com';
+  Future<Map<String, dynamic>?> getUserByUsername(String username) async {
+    final normalized = username.trim().toLowerCase();
+    if (normalized.isEmpty) return null;
+    final users = await _firestore
+        .collection('users')
+        .where('username', isEqualTo: normalized)
+        .limit(1)
+        .get();
+    if (users.docs.isEmpty) return null;
+    return {...users.docs.first.data(), 'id': users.docs.first.id};
   }
 
   static AppUserProfile profileFromMap(Map<String, dynamic> data) {
@@ -229,6 +466,7 @@ class AuthService {
             .trim();
     final groupValue =
         data['group_id'] ??
+        data['groupId'] ??
         data['group'] ??
         data['user_group'] ??
         data['group_name'];
@@ -239,12 +477,19 @@ class AuthService {
         data['tracking_schedule'] ??
         data['schedule'] ??
         data['user_schedule'];
+    final group = groupValue is Map
+        ? (groupValue['group_id'] ?? groupValue['id'] ?? groupValue['name'])
+              ?.toString()
+        : groupValue?.toString();
+    final accountStatus = statusValue is bool
+        ? (statusValue ? 'active' : 'inactive')
+        : statusValue?.toString();
 
     return AppUserProfile(
       username: username.isNotEmpty ? username : 'Unknown user',
       role: data['role']?.toString(),
-      group: groupValue?.toString(),
-      accountStatus: statusValue?.toString(),
+      group: group,
+      accountStatus: accountStatus,
       schedule: rawSchedule is Map<String, dynamic>
           ? TrackingSchedule.fromFirestore(rawSchedule)
           : rawSchedule is Map
@@ -265,19 +510,7 @@ class AuthService {
           normalized == 'enabled' ||
           normalized == 'approved';
     }
-    return true;
-  }
-
-  Future<void> updateUserProfilePassword({
-    required String currentPassword,
-    required String newPassword,
-    required String confirmPassword,
-  }) async {
-    await changePassword(
-      currentPassword: currentPassword,
-      newPassword: newPassword,
-      confirmPassword: confirmPassword,
-    );
+    return false;
   }
 
   static String? validateUsername(String? value) {
@@ -289,8 +522,15 @@ class AuthService {
     return null;
   }
 
-  static String? validatePassword(String? value) {
-    if ((value ?? '').length < 6) {
+  static String? validateLoginPassword(String? value) {
+    if (value == null || value.isEmpty) {
+      return 'Enter a password';
+    }
+    return null;
+  }
+
+  static String? validateNewPassword(String? value) {
+    if ((value ?? '').trim().length < 6) {
       return 'Password must be at least 6 characters';
     }
     return null;

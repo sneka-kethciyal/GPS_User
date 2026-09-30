@@ -1,4 +1,3 @@
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
 import '../services/auth_service.dart';
@@ -34,7 +33,7 @@ class _AuthScreenState extends State<AuthScreen> {
         username: _usernameController.text,
         password: _passwordController.text,
       );
-    } on FirebaseAuthException catch (error) {
+    } on ManagedAuthException catch (error) {
       _showMessage(_authErrorMessage(error));
     } catch (_) {
       _showMessage('Something went wrong. Please try again.');
@@ -43,42 +42,86 @@ class _AuthScreenState extends State<AuthScreen> {
     }
   }
 
+  Future<String?> _promptForUsername() async {
+    final controller = TextEditingController(
+      text: _usernameController.text.trim(),
+    );
+    final result = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Forgot password'),
+          content: TextField(
+            controller: controller,
+            enabled: !_isBusy,
+            textInputAction: TextInputAction.done,
+            decoration: const InputDecoration(
+              labelText: 'Username',
+              prefixIcon: Icon(Icons.person_outline_rounded),
+            ),
+            onSubmitted: (_) =>
+                Navigator.of(dialogContext).pop(controller.text.trim()),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.of(dialogContext).pop(controller.text.trim()),
+              child: const Text('Submit request'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+    return result;
+  }
+
   Future<void> _forgotPassword() async {
-    final username = _usernameController.text.trim();
+    var username = _usernameController.text.trim();
+    if (username.isEmpty) {
+      final prompted = await _promptForUsername();
+      if (prompted == null || prompted.isEmpty) return;
+      username = prompted;
+    }
+
     final validationError = AuthService.validateUsername(username);
     if (validationError != null) {
       _showMessage(validationError);
       return;
     }
+
     setState(() => _isBusy = true);
     try {
-      final isPending = await _authService.requestPasswordReset(username);
-      _showMessage(
-        isPending
-            ? 'Your password reset request is already pending.'
-            : 'Password reset request sent to administrator.',
-      );
-    } on FirebaseAuthException catch (error) {
+      final outcome = await _authService.requestPasswordReset(username);
+      _showMessage(switch (outcome) {
+        PasswordResetRequestOutcome.alreadyPending => 'A password reset request is already pending. Your administrator will review it.',
+        PasswordResetRequestOutcome.created => 'Password reset request submitted. Your administrator must review and reset your password.',
+      });
+    } on ManagedAuthException catch (error) {
       _showMessage(_authErrorMessage(error));
+    } catch (_) {
+      _showMessage('Could not submit the reset request. Please try again.');
     } finally {
       if (mounted) setState(() => _isBusy = false);
     }
   }
 
-  String _authErrorMessage(FirebaseAuthException error) {
+  String _authErrorMessage(ManagedAuthException error) {
     switch (error.code) {
-      case 'email-already-in-use':
-        return 'That username is already registered.';
+      case 'user-disabled':
+        return error.message;
       case 'invalid-credential':
-      case 'wrong-password':
-      case 'user-not-found':
-        return 'Incorrect username or password.';
+        return 'Invalid username or password.';
       case 'weak-password':
         return 'Choose a stronger password.';
       case 'network-request-failed':
         return 'Check your internet connection and try again.';
       default:
-        return error.message ?? 'Authentication failed. Please try again.';
+        return error.message;
     }
   }
 
@@ -141,7 +184,7 @@ class _AuthScreenState extends State<AuthScreen> {
                       obscureText: _obscurePassword,
                       textInputAction: TextInputAction.done,
                       autofillHints: const [AutofillHints.password],
-                      validator: AuthService.validatePassword,
+                      validator: AuthService.validateLoginPassword,
                       onFieldSubmitted: (_) => _submit(),
                       decoration: InputDecoration(
                         labelText: 'Password',

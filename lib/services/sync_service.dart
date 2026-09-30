@@ -2,7 +2,6 @@ import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 
 import 'database_helper.dart';
@@ -58,9 +57,7 @@ class SyncService {
       }
 
       final userId =
-          explicitUserId ??
-          FirebaseAuth.instance.currentUser?.uid ??
-          await _dbHelper.getSetting('current_user_id');
+          explicitUserId ?? await _dbHelper.getSetting('current_user_id');
 
       if (userId == null || userId.isEmpty) {
         debugPrint('[SyncService] No active user ID found for sync.');

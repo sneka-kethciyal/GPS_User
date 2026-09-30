@@ -39,9 +39,9 @@ class DefaultFirebaseOptions {
   );
 
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyA8_ExampleAndroidKeyPlaceholder_EbT2',
-    appId: '1:100000000001:android:ebt99expense02',
-    messagingSenderId: '100000000001',
+    apiKey: 'AIzaSyD9wLW4SviHATSpmV4h1_h-j9W11e81nwg',
+    appId: '1:940424517330:android:34f60c5ddff6045d507f0b',
+    messagingSenderId: '940424517330',
     projectId: 'ebt-expense-geo-tracker',
     storageBucket: 'ebt-expense-geo-tracker.firebasestorage.app',
   );
